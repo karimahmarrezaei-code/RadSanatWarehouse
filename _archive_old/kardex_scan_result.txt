@@ -1,0 +1,54 @@
+======================================================================
+اسکن کوئری های کاردکس / موجودی در کل پروژه
+======================================================================
+
+===== FILE: .\app\core\pallet_service.py =====
+   L53: "    FROM opening_inventory_items WHERE qty > 0 "
+   L56: "    FROM inventory_transactions "
+   L68: "FROM inventory_levels "
+
+===== FILE: .\app\repositories\issue_repository.py =====
+   L209: "FROM inventory_transactions WHERE pallet_id = ? AND transaction_type = 'IN' AND qty_in > 0",
+
+===== FILE: .\app\repositories\opening_inventory_repository.py =====
+   L82: FROM opening_inventory_items oii
+   L175: 'SELECT id, quantity FROM inventory_levels WHERE pallet_id = ? AND warehouse_id = ? LIMIT 1',
+
+===== FILE: .\app\repositories\report_repository.py =====
+   L150: FROM inventory_transactions it
+
+===== FILE: .\app\repositories\return_repository.py =====
+   L126: 'SELECT id FROM inventory_levels WHERE pallet_id = ? AND warehouse_id = ?',
+   L272: FROM inventory_transactions it
+
+===== FILE: .\app\repositories\warehouse_repository.py =====
+   L176: 'SELECT 1 FROM inventory_levels WHERE warehouse_id = ? LIMIT 1',
+
+===== FILE: .\app\ui\box_production_window.py =====
+   L1067: "SELECT id FROM inventory_levels WHERE pallet_id = ? AND warehouse_id = ?",
+   L1206: 'SELECT id FROM inventory_levels WHERE pallet_id = ? AND warehouse_id = ?',
+
+===== FILE: .\app\ui\dead_stock_window.py =====
+   L250: FROM inventory_transactions
+   L253: FROM inventory_levels il
+   L293: SELECT unit_price FROM inventory_transactions
+
+===== FILE: .\app\ui\issue_manager_window.py =====
+   L673: " (SELECT il.warehouse_id FROM inventory_levels il "
+
+===== FILE: .\app\ui\receipt_manager_window.py =====
+   L1116: FROM inventory_transactions t
+
+===== FILE: .\app\ui\stock_take_window.py =====
+   L222: FROM inventory_levels il
+   L232: FROM inventory_transactions
+   L1115: SELECT warehouse_id FROM inventory_levels
+
+===== FILE: .\app\ui\transfer_window.py =====
+   L146: FROM inventory_levels il
+   L237: SELECT quantity FROM inventory_levels
+   L255: SELECT id FROM inventory_levels
+
+======================================================================
+تعداد فایل های دارای کوئری موجودی: 12
+======================================================================

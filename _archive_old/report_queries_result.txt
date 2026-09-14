@@ -1,0 +1,120 @@
+======================================================================
+نمایش کوئری های کاردکس / گزارش موجودی (با context)
+======================================================================
+
+======================================================================
+FILE: .\app\repositories\report_repository.py  (313 خط)
+======================================================================
+
+  ----- خط 70 (context) -----
+     L64:                     COALESCE(SUM(it.qty_in - it.qty_out), 0) AS current_qty,
+     L65:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'IN' THEN it.total_price ELSE 0 END), 0) AS total_in_value,
+     L66:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'OUT' THEN it.total_price ELSE 0 END), 0) AS total_out_value,
+     L67:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'IN' THEN it.total_price ELSE -it.total_price END), 0) AS current_value,
+     L68:                     MAX(it.transaction_date) AS last_transaction_date
+     L69:                 FROM pallets p
+  >> L70:                 LEFT JOIN inventory_transactions it
+     L71:                     ON it.pallet_id = p.id AND it.warehouse_id = ?
+     L72:                 GROUP BY p.id
+     L73:                 HAVING total_in_qty > 0 OR total_out_qty > 0 OR current_qty <> 0 OR current_value <> 0
+     L74:                 ORDER BY p.name
+     L75:             '''
+     L76:             rows = connection.execute(query, (warehouse_id,)).fetchall()
+
+  ----- خط 150 (context) -----
+     L144:                     it.total_price,
+     L145:                     it.description,
+     L146:                     wr.receipt_no,
+     L147:                     wi.issue_no,
+     L148:                     ir.reference_no AS inbound_reference_no,
+     L149:                     ol.reference_no AS outbound_reference_no
+  >> L150:                 FROM inventory_transactions it
+     L151:                 JOIN pallets p ON p.id = it.pallet_id
+     L152:                 JOIN warehouses w ON w.id = it.warehouse_id
+     L153:                 LEFT JOIN warehouse_receipts wr ON it.reference_type = 'RECEIPT' AND wr.id = it.reference_id
+     L154:                 LEFT JOIN inbound_loads ir ON ir.id = wr.inbound_load_id
+     L155:                 LEFT JOIN warehouse_issues wi ON it.reference_type = 'ISSUE' AND wi.id = it.reference_id
+     L156:                 LEFT JOIN outbound_loads ol ON ol.id = wi.outbound_load_id
+
+  ----- خط 251 (context) -----
+     L245:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'IN' THEN it.total_price ELSE 0 END), 0) AS total_in_value,
+     L246:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'OUT' THEN it.total_price ELSE 0 END), 0) AS total_out_value,
+     L247:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'IN' THEN it.total_price ELSE -it.total_price END), 0) AS current_value,
+     L248:                     COUNT(DISTINCT CASE WHEN it.id IS NOT NULL THEN it.pallet_id END) AS pallet_type_count,
+     L249:                     MAX(it.transaction_date) AS last_transaction_date
+     L250:                 FROM warehouses w
+  >> L251:                 LEFT JOIN inventory_transactions it ON it.warehouse_id = w.id
+     L252:                 WHERE w.is_active = 1
+     L253:                 GROUP BY w.id
+     L254:                 ORDER BY w.name
+     L255:                 '''
+     L256:             ).fetchall()
+     L257: 
+
+  ----- خط 276 (context) -----
+     L270:                     COALESCE(SUM(it.qty_in - it.qty_out), 0) AS current_qty,
+     L271:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'IN' THEN it.total_price ELSE 0 END), 0) AS total_in_value,
+     L272:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'OUT' THEN it.total_price ELSE 0 END), 0) AS total_out_value,
+     L273:                     COALESCE(SUM(CASE WHEN it.transaction_type = 'IN' THEN it.total_price ELSE -it.total_price END), 0) AS current_value,
+     L274:                     MAX(it.transaction_date) AS last_transaction_date
+     L275:                 FROM pallets p
+  >> L276:                 LEFT JOIN inventory_transactions it ON it.pallet_id = p.id
+     L277:                 WHERE p.is_active = 1
+     L278:                 GROUP BY p.id
+     L279:                 HAVING total_in_qty > 0 OR total_out_qty > 0 OR current_qty <> 0 OR current_value <> 0
+     L280:                 ORDER BY p.name
+     L281:                 '''
+     L282:             ).fetchall()
+
+======================================================================
+FILE: .\app\ui\dead_stock_window.py  (629 خط)
+======================================================================
+
+  ----- خط 250 (context) -----
+     L244:                     il.warehouse_id,
+     L245:                     il.quantity as current_stock,
+     L246:                     p.code as pallet_code,
+     L247:                     p.name as pallet_name,
+     L248:                     w.name as warehouse_name,
+     L249:                     (SELECT MAX(transaction_date)
+  >> L250:                      FROM inventory_transactions
+     L251:                      WHERE pallet_id = il.pallet_id
+     L252:                        AND warehouse_id = il.warehouse_id) as last_movement
+     L253:                 FROM inventory_levels il
+     L254:                 JOIN pallets p ON p.id = il.pallet_id
+     L255:                 JOIN warehouses w ON w.id = il.warehouse_id
+     L256:                 WHERE il.quantity > 0
+
+  ----- خط 253 (context) -----
+     L247:                     p.name as pallet_name,
+     L248:                     w.name as warehouse_name,
+     L249:                     (SELECT MAX(transaction_date)
+     L250:                      FROM inventory_transactions
+     L251:                      WHERE pallet_id = il.pallet_id
+     L252:                        AND warehouse_id = il.warehouse_id) as last_movement
+  >> L253:                 FROM inventory_levels il
+     L254:                 JOIN pallets p ON p.id = il.pallet_id
+     L255:                 JOIN warehouses w ON w.id = il.warehouse_id
+     L256:                 WHERE il.quantity > 0
+     L257:             '''
+     L258:             params = []
+     L259: 
+
+  ----- خط 293 (context) -----
+     L287:             current_stock = int(r['current_stock'] or 0)
+     L288: 
+     L289:             # محاسبه ارزش (نیاز به خواندن قیمت از آخرین تراکنش)
+     L290:             unit_price = 0
+     L291:             with self.db.connect() as conn2:
+     L292:                 price_row = conn2.execute('''
+  >> L293:                     SELECT unit_price FROM inventory_transactions
+     L294:                     WHERE pallet_id = ? AND warehouse_id = ?
+     L295:                     ORDER BY transaction_date DESC, id DESC LIMIT 1
+     L296:                 ''', (r['pallet_id'], r['warehouse_id'])).fetchone()
+     L297:                 if price_row:
+     L298:                     unit_price = int(price_row['unit_price'] or 0)
+     L299: 
+
+======================================================================
+تمام!
+======================================================================

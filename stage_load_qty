@@ -1,0 +1,31 @@
+# -*- coding: utf-8 -*-
+"""مرحله 2: تعمیر قالب رسید انبار - اجرا: python fix_receipt_final.py"""
+import os, py_compile
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+q = os.path.join(ROOT, 'app', 'repositories', 'receipt_repository.py')
+s = open(q, encoding='utf-8').read()
+
+i = s.find('def render_receipt_html')
+f = s.find('.format(', i)
+if i >= 0 and f >= 0:
+    region = s[f:f + 2500]
+    added = []
+    if 'stage_load_qty=' not in region:
+        ins = "stage_load_qty=context.get('stage_load_qty', 0) or 0, "
+        s = s[:f + len('.format(')] + ins + s[f + len('.format('):]
+        added.append('stage_load_qty')
+    if 'operation_date_jalali=' not in region:
+        ins = "operation_date_jalali=context.get('operation_date_jalali', '') or context.get('jalali_date_text', '') or '', "
+        pos = s.find('.format(', i) + len('.format(')
+        s = s[:pos] + ins + s[pos:]
+        added.append('operation_date_jalali')
+    if added:
+        open(q, 'w', encoding='utf-8').write(s)
+        py_compile.compile(q, doraise=True)
+        print('✔ کلیدهای افزوده به رسید:', ', '.join(added))
+    else:
+        print('· کلیدها از قبل بودند')
+else:
+    print('❌ تابع رسید پیدا نشد')
+input('Enter...')

@@ -1,0 +1,2407 @@
+# -*- coding: utf-8 -*-
+"""Issue Manager Window - فرم حواله خروج انبار (نسخه نهایی کامل)"""
+import tempfile
+import webbrowser
+from typing import Any, Dict, List, Optional, Set
+
+from PyQt5.QtCore import QTimer, QDate, Qt, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QGuiApplication
+from PyQt5.QtWidgets import (
+    QCheckBox, QAbstractItemView, QComboBox, QDateEdit, QDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QSpinBox, QTableWidget, QScrollArea, QTableWidgetItem,
+    QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QApplication,
+    QFileDialog,
+)
+from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+
+from app.ui.theme_manager import apply_theme
+from app.core.database import DatabaseManager
+from app.core.jalali import jalali_date_display_from_iso, today_iso_date
+from app.core.pallet_service import PalletService
+from app.repositories.issue_repository import IssueRepository
+from app.core.stock_service import free_stock  # ONE-STOCK
+
+
+class _OldInternalPreview_Disabled(QDialog):  # DLG-FINAL
+    def __init__(self, title: str, html: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1600, 950)
+        layout = QVBoxLayout(self)
+        toolbar = QHBoxLayout()
+        self.print_button = QPushButton('پرینت')
+        self.print_button.setObjectName('PrimaryButton')
+        self.print_button.clicked.connect(self._print_document)
+        self.pdf_button = QPushButton('ذخیره PDF')
+        self.pdf_button.setObjectName('PurpleButton')
+        self.pdf_button.clicked.connect(self._save_pdf)
+        close_button = QPushButton('بستن')
+        close_button.setObjectName('SecondaryButton')
+        close_button.clicked.connect(self.accept)
+        toolbar.addWidget(self.print_button)
+        toolbar.addWidget(self.pdf_button)
+        toolbar.addStretch()
+        toolbar.addWidget(close_button)
+        layout.addLayout(toolbar)
+        self.browser = QWebEngineView()
+        self.browser.setHtml(html)
+        layout.addWidget(self.browser)
+
+    def _print_document(self) -> None:
+        try:
+            printer = QPrinter(QPrinter.HighResolution)
+            dlg = QPrintDialog(printer, self)
+            if dlg.exec_() == QPrintDialog.Accepted:
+                self.browser.page().print_(printer)
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', 'خطا در پرینت:\n{}'.format(exc))
+
+    def _save_pdf(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'ذخیره فایل PDF', 'حواله-خروج.pdf', 'PDF Files (*.pdf)')
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.pdf'):
+            file_path += '.pdf'
+        self.browser.page().printToPdf(file_path)
+        QMessageBox.information(self, 'موفق', 'فایل PDF ذخیره شد:\n{}'.format(file_path))
+
+
+class IssueManagerWindow(QDialog):
+    data_changed = pyqtSignal()
+
+    def __init__(self, db: DatabaseManager, user_data: Dict[str, Any] = None) -> None:
+        super().__init__()
+
+        self.db = db
+        self.user_data = user_data or {}
+        self.repository = IssueRepository(db)
+
+        permissions = set(self.user_data.get('permissions', []) or [])
+        self.can_manage = 'issues.manage' in permissions or self.user_data.get('role_code') == 'ADMIN'
+
+        self.customers: List[Dict[str, Any]] = []
+        self.drivers: List[Dict[str, Any]] = []
+        self.pallets: List[Dict[str, Any]] = []
+        self.warehouses: List[Dict[str, Any]] = []
+        self.open_references: List[Dict[str, Any]] = []
+        self.avg_pallet_prices: Dict[int, float] = {}
+        self.pallet_stock: Dict[int, int] = {}
+        self.allowed_pallet_ids: Optional[Set[int]] = None
+        self.current_theme = 'dark'
+
+        self.setWindowTitle('حواله خروج انبار')
+        self.resize(1600, 950)
+
+        self._build_ui()
+        self._sync_outbound_remaining()
+        self._load_pallet_prices()
+        self._load_lookups()
+        self.refresh_issues_final()
+
+        # پیام راهنمای ورود
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(
+            500,
+            lambda: QMessageBox.information(
+                self,
+                "راهنما",
+                "برای مشاهده لیست، ابتدا انبار مقصد را انتخاب کنید."
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Archive
+    # ------------------------------------------------------------------
+    def open_cancelled_issues_archive(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle('بایگانی حواله‌های ابطال‌شده')
+        dialog.resize(900, 500)
+        dialog.setLayoutDirection(Qt.RightToLeft)
+
+        layout = QVBoxLayout(dialog)
+
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(
+            ['شناسه', 'شماره حواله', 'مرجع خروج', 'تاریخ', 'تعداد', 'دلیل ابطال']
+        )
+
+        with self.db.connect() as conn:
+            conn.row_factory = None
+            rows = conn.execute(
+                "SELECT wi.id, wi.issue_no, COALESCE(ol.reference_no,'-'), wi.issue_date, "
+                " COALESCE(wi.delivered_qty,0), COALESCE(wi.cancel_reason,'-') "
+                "FROM warehouse_issues wi "
+                "LEFT JOIN outbound_loads ol ON ol.id = wi.outbound_load_id "
+                "WHERE wi.issue_status = 'CANCELLED' ORDER BY wi.id DESC"
+            ).fetchall()
+
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for col, v in enumerate([str(r[0]), r[1], r[2], r[3] or '-', str(r[4]), r[5]]):
+                cell = QTableWidgetItem(str(v))
+                cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(i, col, cell)
+
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+
+        close_btn = QPushButton('بستن')
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec_()
+
+    # ------------------------------------------------------------------
+    # Lookups
+    # ------------------------------------------------------------------
+    def _load_lookups(self) -> None:
+        """لود داده‌های پایه و پر کردن کامبو باکس‌ها"""
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+
+                # 1. مشتریان
+                rows = conn.execute(
+                    "SELECT p.id, p.first_name, p.last_name "
+                    "FROM persons p JOIN person_roles pr ON pr.person_id = p.id "
+                    "WHERE pr.role_type = 'CUSTOMER' AND p.is_active = 1 "
+                    "ORDER BY p.first_name, p.last_name"
+                ).fetchall()
+                self.customers = [
+                    {'id': r[0], 'first_name': r[1] or '', 'last_name': r[2] or ''}
+                    for r in rows
+                ]
+
+                # 2. رانندگان + خودرو
+                rows = conn.execute(
+                    "SELECT p.id, p.first_name, p.last_name, "
+                    "       COALESCE(dp.vehicle_type,''), COALESCE(dp.vehicle_plate,'') "
+                    "FROM persons p "
+                    "JOIN person_roles pr ON pr.person_id = p.id "
+                    "LEFT JOIN driver_profiles dp ON dp.person_id = p.id "
+                    "WHERE pr.role_type = 'DRIVER' AND p.is_active = 1"
+                ).fetchall()
+                self.drivers = [
+                    {
+                        'id': r[0],
+                        'first_name': r[1] or '',
+                        'last_name': r[2] or '',
+                        'vehicle_type': r[3] or '',
+                        'vehicle_plate': r[4] or ''
+                    }
+                    for r in rows
+                ]
+
+                # 3. پالت‌ها
+                rows = conn.execute(
+                    "SELECT id, code, name FROM pallets WHERE is_active=1 ORDER BY code"
+                ).fetchall()
+                self.pallets = [
+                    {'id': r[0], 'code': r[1] or '', 'name': r[2] or ''}
+                    for r in rows
+                ]
+
+                # 4. انبارها
+                rows = conn.execute(
+                    "SELECT id, code, name FROM warehouses WHERE is_active=1 ORDER BY code"
+                ).fetchall()
+                self.warehouses = [
+                    {'id': r[0], 'code': r[1] or '', 'name': r[2] or ''}
+                    for r in rows
+                ]
+
+                if hasattr(self, 'warehouse_combo'):
+                    self.warehouse_combo.blockSignals(True)
+                    self.warehouse_combo.clear()
+                    self.warehouse_combo.addItem('-- ابتدا انبار را انتخاب کنید --', None)
+                    for w in self.warehouses:
+                        self.warehouse_combo.addItem(
+                            "{} | {}".format(w.get('code', ''), w.get('name', '')),
+                            w.get('id')
+                        )
+                    self.warehouse_combo.blockSignals(False)
+
+                # 5. مرجع‌های خروج باز
+                try:  # REF-SYNC
+                    conn.execute("UPDATE outbound_loads SET remaining_qty = (SELECT COALESCE(SUM(qty),0) FROM outbound_load_items oli2 WHERE oli2.outbound_load_id=outbound_loads.id) - COALESCE((SELECT SUM(wii.qty) FROM warehouse_issue_items wii JOIN warehouse_issues wi ON wi.id=wii.issue_id WHERE wi.outbound_load_id=outbound_loads.id AND wi.issue_status!='CANCELLED'),0), load_status = CASE WHEN (SELECT COALESCE(SUM(qty),0) FROM outbound_load_items oli2 WHERE oli2.outbound_load_id=outbound_loads.id) - COALESCE((SELECT SUM(wii.qty) FROM warehouse_issue_items wii JOIN warehouse_issues wi ON wi.id=wii.issue_id WHERE wi.outbound_load_id=outbound_loads.id AND wi.issue_status!='CANCELLED'),0) > 0 THEN 'OPEN' ELSE 'COMPLETE' END WHERE is_active=1")  # REF-SYNC
+                except Exception:  # REF-SYNC
+                    pass  # REF-SYNC
+                rows = conn.execute(
+                    "SELECT id, reference_no, customer_id, driver_id, total_load_qty, remaining_qty, "
+                    "waybill_no, source_location, destination_location "
+                    "FROM outbound_loads "
+                    "WHERE is_active = 1 AND remaining_qty > 0 "
+                    "ORDER BY id DESC"
+                ).fetchall()
+
+                self.open_references = []
+                for r in rows:
+                    self.open_references.append({
+                        'id': r[0],
+                        'reference_no': r[1] or 'نامشخص',
+                        'customer_id': r[2],
+                        'driver_id': r[3],
+                        'total_load_qty': r[4] or 0,
+                        'remaining_qty': r[5] or 0,
+                        'waybill_no': r[6] or '',
+                        'source_location': r[7] or '',
+                        'destination_location': r[8] or ''
+                    })
+
+        except Exception as e:
+            print('Load lookups error:', str(e))
+            self.customers = getattr(self, 'customers', [])
+            self.drivers = getattr(self, 'drivers', [])
+            self.pallets = getattr(self, 'pallets', [])
+            self.warehouses = getattr(self, 'warehouses', [])
+            self.open_references = getattr(self, 'open_references', [])
+
+        # پر کردن کامبو باکس مشتریان
+        self.customer_combo.clear()
+        self.customer_combo.addItem('انتخاب کنید', None)
+        for c in self.customers:
+            name = "{} {}".format(c.get('first_name', ''), c.get('last_name', '')).strip()
+            self.customer_combo.addItem(name, c.get('id'))
+
+        # پر کردن کامبو باکس رانندگان
+        self.driver_combo.clear()
+        self.driver_combo.addItem('انتخاب کنید', None)
+        for d in self.drivers:
+            name = "{} {} | {}".format(
+                d.get('first_name', ''),
+                d.get('last_name', ''),
+                d.get('vehicle_plate', '-')
+            ).strip()
+            self.driver_combo.addItem(name, d.get('id'))
+
+        # پر کردن کامبو باکس مرجع خروج
+        self.reference_selector_combo.blockSignals(True)
+        self.reference_selector_combo.clear()
+        self.reference_selector_combo.addItem('مرجع خروج جدید', None)
+
+        self.cust_map = {}
+        for c in self.customers:
+            cid = c.get('id')
+            if cid:
+                cname = "{} {}".format(c.get('first_name', ''), c.get('last_name', '')).strip()
+                self.cust_map[cid] = cname
+
+        for ref in self.open_references:
+            ref_no = ref.get('reference_no', 'نامشخص')
+            cust_id = ref.get('customer_id')
+            try:  # LIVE-REM
+                with self.db.connect() as _cn9:  # LIVE-REM
+                    _cn9.row_factory = None  # LIVE-REM
+                    _pl = _cn9.execute("SELECT COALESCE(SUM(qty),0) FROM outbound_load_items WHERE outbound_load_id=?", (ref.get('id'),)).fetchone()[0]  # LIVE-REM
+                    _is9 = _cn9.execute("SELECT COALESCE(SUM(wii.qty),0) FROM warehouse_issue_items wii JOIN warehouse_issues wi ON wi.id=wii.issue_id WHERE wi.outbound_load_id=? AND wi.issue_status!='CANCELLED'", (ref.get('id'),)).fetchone()[0]  # LIVE-REM
+                    remaining = int(_pl or 0) - int(_is9 or 0)  # LIVE-REM
+            except Exception:  # LIVE-REM
+                remaining = int(ref.get('remaining_qty', 0) or 0)  # LIVE-REM
+            cust_name = self.cust_map.get(cust_id, '-') if cust_id else '-'
+            label = "{} | مشتری: {} | مانده: {:,}".format(ref_no, cust_name, int(remaining or 0))
+            self.reference_selector_combo.addItem(label, ref.get('id'))
+
+        self.reference_selector_combo.blockSignals(False)
+
+
+        if hasattr(self, 'reference_selector_combo'):
+            self._refresh_reference_combo()
+    def _load_pallet_prices(self) -> None:
+        self.pallet_service = getattr(self, 'pallet_service', None) or PalletService(self.db)
+        self.pallet_service.reload()
+        self.avg_pallet_prices = self.pallet_service.prices_map()
+        self.pallet_stock = self.pallet_service.stock_map()
+
+        if hasattr(self, 'lines_table'):
+            self._refresh_pallet_combos()
+
+    # ------------------------------------------------------------------
+    # Stock / price helpers
+    # ------------------------------------------------------------------
+    def _stock_for_warehouse(self, pallet_id: int, warehouse_id):
+        if not warehouse_id:
+            return self.pallet_stock.get(pallet_id, 0)
+        try:
+            with self.db.connect() as conn:
+                r = conn.execute(
+                    "SELECT quantity FROM inventory_levels WHERE pallet_id=? AND warehouse_id=?",
+                    (pallet_id, warehouse_id)
+                ).fetchone()
+                return int(free_stock(self.db, pallet_id) or 0)  # ONE-STOCK
+        except Exception:
+            return 0
+
+    def _sale_avg_for_pallet(self, pallet_id: int):
+        try:
+            with self.db.connect() as conn:
+                r = conn.execute(
+                    "SELECT AVG(unit_price) a FROM warehouse_issue_items "
+                    "WHERE pallet_id=? AND unit_price>0",
+                    (pallet_id,)
+                ).fetchone()
+                return int(r[0] or 0)
+        except Exception:
+            return 0
+
+    def _avg_price_for_warehouse(self, pallet_id, warehouse_id):
+        """[AVG] میانگین: اول کاردکس (رسید)، بعد سند افتتاحیه، بعد قیمت پایه"""
+        fb = int(getattr(self, 'avg_pallet_prices', {}).get(pallet_id, 0) or 0)
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                if warehouse_id:
+                    r = conn.execute("SELECT COALESCE(SUM(qty_in*unit_price),0)/COALESCE(SUM(qty_in),0) FROM inventory_transactions WHERE pallet_id=? AND warehouse_id=? AND qty_in>0 AND unit_price>0 AND reference_type<>'TRANSFER'", (pallet_id, warehouse_id)).fetchone()
+                    if r and r[0]:
+                        return int(r[0])
+                r2 = conn.execute("SELECT COALESCE(SUM(qty*unit_price),0)/COALESCE(SUM(qty),0) FROM opening_inventory_items WHERE pallet_id=? AND qty>0 AND unit_price>0", (pallet_id,)).fetchone()
+                if r2 and r2[0]:
+                    return int(r2[0])
+                try:
+                    r3 = conn.execute("SELECT price FROM pallets WHERE id=?", (pallet_id,)).fetchone()
+                    if r3 and r3[0]:
+                        return int(r3[0])
+                except Exception:
+                    pass
+                return fb
+        except Exception:
+            return fb
+
+    def _pallet_options(self, extra_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        if self.allowed_pallet_ids is None:
+            return self.pallets
+
+        options = [p for p in self.pallets if p['id'] in self.allowed_pallet_ids]
+
+        if extra_id and not any(p['id'] == extra_id for p in options):
+            extra = next((p for p in self.pallets if p['id'] == extra_id), None)
+            if extra:
+                options.append(extra)
+
+        return options if options else self.pallets
+
+    def _pallet_options_for_warehouse(self):
+        wid = self.warehouse_combo.currentData() if hasattr(self, 'warehouse_combo') else None
+        ref_id = self.reference_selector_combo.currentData() if hasattr(self, 'reference_selector_combo') else None
+        committed = self._committed_qty_map(ref_id) if wid else {}
+        result = []
+
+        for p in self._pallet_options():
+            in_allowed = self.allowed_pallet_ids is not None and p['id'] in self.allowed_pallet_ids
+            phys = self._stock_for_warehouse(p['id'], wid) if wid else self.pallet_stock.get(p['id'], 0)
+            s = int(phys) - int(committed.get(p['id'], 0)) if wid else int(phys)
+
+            if (not wid) or in_allowed or s > 0:
+                a = self._avg_price_for_warehouse(p['id'], wid) or int(self.avg_pallet_prices.get(p['id'], 0) or 0)
+                result.append((p, s, a))
+
+        return result
+
+
+    def _get_reference_info(self, reference_id):
+        if not reference_id:
+            return None
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                r = conn.execute(
+                    "SELECT ol.id, ol.reference_no, ol.customer_id, ol.driver_id, "
+                       "(SELECT COALESCE(SUM(qty), 0) FROM outbound_load_items WHERE outbound_load_id = ol.id), "  # REF-CLEAN
+                       "(SELECT COALESCE(SUM(wii.qty), 0) FROM warehouse_issue_items wii JOIN warehouse_issues wi ON wi.id = wii.issue_id WHERE wi.outbound_load_id = ol.id AND wi.issue_status != 'CANCELLED'), "  # REF-CLEAN
+                       "(SELECT COUNT(*) FROM warehouse_issues wi WHERE wi.outbound_load_id = ol.id AND wi.issue_status != 'CANCELLED'), "  # REF-CLEAN
+                    "                 WHERE wi.outbound_load_id = ol.id "
+                    "                   AND wi.issue_status != 'CANCELLED'), 0), "
+                    "       COALESCE(ol.waybill_no, ''), COALESCE(ol.source_location, ''), "
+                    "       COALESCE(ol.destination_location, '') "
+                    "FROM outbound_loads ol WHERE ol.id = ?",
+                    (reference_id,)
+                ).fetchone()
+                if not r:
+                    return None
+                total_load = int(r[4] or 0)
+                delivered_sum = int(r[5] or 0)
+                return {'id': r[0], 'reference_no': r[1] or 'نامشخص', 'customer_id': r[2],
+                        'driver_id': r[3], 'total_load_qty': total_load,
+                        'remaining_qty': max(total_load - delivered_sum, 0),
+                        'waybill_no': r[6] or '', 'source_location': r[7] or '',
+                        'destination_location': r[8] or ''}
+        except Exception as e:
+            print('get reference info error:', e)
+            return None
+
+    def _sync_outbound_remaining(self) -> None:
+        try:
+            with self.db.connect() as conn:
+                conn.execute("""
+                    UPDATE outbound_loads
+                    SET remaining_qty = MAX(0,
+                            COALESCE(total_load_qty, 0) -
+                            COALESCE((SELECT SUM(COALESCE(wi.delivered_qty, 0))
+                                      FROM warehouse_issues wi
+                                      WHERE wi.outbound_load_id = outbound_loads.id
+                                        AND wi.issue_status != 'CANCELLED'), 0)),
+                        issued_qty_total = COALESCE((SELECT SUM(COALESCE(wi.stage_load_qty, 0))
+                                      FROM warehouse_issues wi
+                                      WHERE wi.outbound_load_id = outbound_loads.id
+                                        AND wi.issue_status != 'CANCELLED'), 0),
+                        load_status = CASE
+                            WHEN COALESCE((SELECT SUM(COALESCE(wi.delivered_qty, 0))
+                                           FROM warehouse_issues wi
+                                           WHERE wi.outbound_load_id = outbound_loads.id
+                                             AND wi.issue_status != 'CANCELLED'), 0) <= 0 THEN 'OPEN'
+                            WHEN COALESCE((SELECT SUM(COALESCE(wi.delivered_qty, 0))
+                                           FROM warehouse_issues wi
+                                           WHERE wi.outbound_load_id = outbound_loads.id
+                                             AND wi.issue_status != 'CANCELLED'), 0) >= COALESCE(total_load_qty, 0) THEN 'COMPLETE'
+                            ELSE 'PARTIAL'
+                        END
+                    WHERE is_active = 1
+                """)
+                conn.commit()
+        except Exception as e:
+            print('[sync] outbound repair skipped:', e)
+
+
+
+    def _infer_reference_warehouse(self, reference_id):
+        """حدس انبار مرجعِ بدون انبار: پیش‌فاکتور CONVERTED هم‌امضا"""
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                ol = conn.execute("SELECT customer_id FROM outbound_loads WHERE id=?", (reference_id,)).fetchone()
+                if not ol:
+                    return None
+                items = conn.execute("SELECT pallet_id, SUM(qty) FROM outbound_load_items WHERE outbound_load_id=? GROUP BY pallet_id ORDER BY pallet_id", (reference_id,)).fetchall()
+                if not items:
+                    return None
+                sig = '|'.join('{}:{}'.format(a, int(b or 0)) for a, b in items)
+                pros = conn.execute("SELECT id, warehouse_id FROM proforma_invoices WHERE status='CONVERTED' AND COALESCE(customer_id,0)=COALESCE(?,0) ORDER BY id DESC", (ol[0],)).fetchall()
+                for pid, pwh in pros:
+                    if not pwh:
+                        continue
+                    pitems = conn.execute("SELECT pallet_id, SUM(quantity) FROM proforma_invoice_items WHERE proforma_id=? GROUP BY pallet_id ORDER BY pallet_id", (pid,)).fetchall()
+                    if '|'.join('{}:{}'.format(a, int(b or 0)) for a, b in pitems) == sig:
+                        return int(pwh)
+                return None
+        except Exception:
+            return None
+
+    def _refresh_reference_combo(self):
+        if not getattr(self, '_ref_lbl_hooked', False):
+            self._ref_lbl_hooked = True
+            try:
+                self.reference_selector_combo.currentIndexChanged.connect(lambda *_: self._update_ref_remaining_label())
+            except Exception:
+                pass
+            QTimer.singleShot(0, self._update_ref_remaining_label)
+
+        """✅ لیست مراجع باز فقط بر اساس انبار انتخابی"""
+        wid = self.warehouse_combo.currentData() if hasattr(self, 'warehouse_combo') else None
+        cust_map = {}
+        for c in self.customers:
+            cid = c.get('id')
+            if cid:
+                cust_map[cid] = "{} {}".format(c.get('first_name', ''), c.get('last_name', '')).strip()
+        self.reference_selector_combo.blockSignals(True)
+        cur = self.reference_selector_combo.currentData()
+        self.reference_selector_combo.clear()
+        self.reference_selector_combo.addItem('مرجع خروج جدید', None)
+        if not wid:
+            # بدون انتخاب انبار، لیستی نمایش داده نمی‌شود (قانون: بر اساس انبار)
+            self.reference_selector_combo.blockSignals(False)
+            return
+        wh_map = {}
+        try:
+            with self.db.connect() as conn:
+                for r in conn.execute("""SELECT wi.outbound_load_id, wii.warehouse_id
+                    FROM warehouse_issues wi
+                    JOIN warehouse_issue_items wii ON wii.issue_id=wi.id
+                    WHERE COALESCE(wi.issue_status,'CONFIRMED')<>'CANCELLED'"""):
+                    wh_map.setdefault(r[0], set()).add(r[1])
+        except Exception:
+            pass
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                rows = conn.execute("""
+                    SELECT ol.id, ol.reference_no, ol.customer_id,
+                           (SELECT COALESCE(SUM(qty), 0) FROM outbound_load_items WHERE outbound_load_id = ol.id),
+                           COALESCE((SELECT COALESCE(SUM(wii.qty), 0) FROM warehouse_issue_items wii JOIN warehouse_issues wi ON wi.id = wii.issue_id WHERE wi.outbound_load_id = ol.id AND wi.issue_status != 'CANCELLED'), 0),
+                           (SELECT COUNT(*) FROM warehouse_issues wi
+                             WHERE wi.outbound_load_id = ol.id
+                               AND wi.issue_status != 'CANCELLED'),
+                 ol.warehouse_id
+                 FROM outbound_loads ol
+                    WHERE ol.is_active = 1
+                    ORDER BY ol.id DESC
+                """).fetchall()
+            for row in rows:
+                ref_id, ref_no, cust_id = row[0], row[1] or 'نامشخص', row[2]
+                total_load = int(row[3] or 0)
+                delivered_sum = int(row[4] or 0)
+                issue_cnt = int(row[5] or 0)
+                remaining = max(total_load - delivered_sum, 0)
+                if issue_cnt > 0 and remaining <= 0:
+                    continue
+                ol_wh = row[6]
+                rws = wh_map.get(ref_id) or set()
+                if ol_wh:
+                    if int(ol_wh) != int(wid):
+                        continue
+                else:
+                    inferred = self._infer_reference_warehouse(ref_id)
+                    if inferred:
+                        if int(inferred) != int(wid):
+                            continue
+                    elif rws and (None not in rws) and (wid not in rws):
+                        continue
+                cust_name = cust_map.get(cust_id, '-') if cust_id else '-'
+                label = "{} | مشتری: {} | مانده: {:,}".format(ref_no, cust_name, remaining)
+                self.reference_selector_combo.addItem(label, ref_id)
+        except Exception as e:
+            print('Error loading references:', e)
+        if cur:
+            idx = self.reference_selector_combo.findData(cur)
+            if idx >= 0:
+                self.reference_selector_combo.setCurrentIndex(idx)
+        self.reference_selector_combo.blockSignals(False)
+    def _on_warehouse_changed(self):
+        wid = self.warehouse_combo.currentData()
+
+        if not wid:
+            self.warehouse_msg_lbl.show()
+            return
+
+        if self.lines_table.rowCount() > 0:
+            answer = QMessageBox.question(
+                self,
+                'تغییر انبار',
+                'با تغییر انبار، همه ردیف‌های فعلی پاک می‌شوند. ادامه می‌دهید؟',
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if answer != QMessageBox.Yes:
+                self.warehouse_combo.blockSignals(True)
+                self.warehouse_combo.setCurrentIndex(0)
+                self.warehouse_combo.blockSignals(False)
+                return
+            self.lines_table.setRowCount(0)
+
+        self.warehouse_msg_lbl.hide()
+        self.warehouse_combo.setEnabled(False)
+        self.reference_selector_combo.setCurrentIndex(0)
+
+        self._refresh_reference_combo()
+        self._refresh_pallet_combos()
+
+        if self.lines_table.rowCount() == 0:
+            self.add_line_row()
+
+
+
+    def _reference_selection_changed(self) -> None:
+        selected_reference_id = self.reference_selector_combo.currentData()
+        if selected_reference_id:
+            ids = self.repository.list_outbound_load_pallet_ids(selected_reference_id)
+            self.allowed_pallet_ids = set(ids) if ids else None
+            reference = self._get_reference_info(selected_reference_id)
+            if reference:
+                self._select_combo_by_data(self.customer_combo, reference.get('customer_id'))
+                self._select_combo_by_data(self.driver_combo, reference.get('driver_id'))
+                self.waybill_edit.setText(reference.get('waybill_no') or '')
+                self.source_location_edit.setText(reference.get('source_location') or '')
+                self.destination_location_edit.setText(reference.get('destination_location') or '')
+                remaining = int(reference['remaining_qty'])
+                self.stage_declared_edit.setText(self._fmt_int(max(remaining, 0)))
+                self.delivered_edit.setText(self._fmt_int(max(remaining, 0)))
+        else:
+            self.allowed_pallet_ids = None
+            self.total_declared_edit.clear()
+            self.stage_declared_edit.clear()
+            self.delivered_edit.clear()
+            self.waybill_edit.clear()
+            self.source_location_edit.clear()
+            self.destination_location_edit.clear()
+        self._refresh_pallet_combos()
+        self._refresh_reference_numbers()
+        self._driver_changed()
+        self._on_quantity_changed()
+
+    def _update_ref_remaining_label(self):
+        try:
+            from PyQt5.QtWidgets import QLabel
+            combo = getattr(self, 'reference_selector_combo', None)
+            if combo is None:
+                return
+            if not hasattr(self, 'ref_remaining_label'):
+                self.ref_remaining_label = QLabel('')
+                self.ref_remaining_label.setStyleSheet('color: #f59e0b; font-weight: bold; padding: 2px 6px;')
+                try:
+                    combo.parentWidget().layout().addWidget(self.ref_remaining_label)
+                except Exception:
+                    pass
+            ref_id = combo.currentData()
+            if not ref_id:
+                self.ref_remaining_label.setText('')
+                return
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                rows = conn.execute(
+                    "SELECT oli.pallet_id, p.code, COALESCE(SUM(oli.qty),0) "
+                    "FROM outbound_load_items oli JOIN pallets p ON p.id = oli.pallet_id "
+                    "WHERE oli.outbound_load_id = ? GROUP BY oli.pallet_id ORDER BY oli.row_no",
+                    (ref_id,)).fetchall()
+                issued = conn.execute(
+                    "SELECT wii.pallet_id, COALESCE(SUM(wii.qty),0) FROM warehouse_issue_items wii "
+                    "JOIN warehouse_issues wi ON wi.id = wii.issue_id "
+                    "WHERE wi.outbound_load_id = ? AND wi.issue_status != 'CANCELLED' "
+                    "GROUP BY wii.pallet_id", (ref_id,)).fetchall()
+            iss_map = {r[0]: int(r[1] or 0) for r in issued}
+            parts = []
+            for pid, code, q in rows:
+                rem = int(q or 0) - iss_map.get(pid, 0)
+                parts.append('{}: {}'.format(code, rem))
+            self.ref_remaining_label.setText('مانده مرجع → ' + ' | '.join(parts) if parts else '')
+        except Exception:
+            pass
+    def _refresh_reference_numbers(self) -> None:
+        iso_date = self._current_iso_date()
+        self.date_info_label.setText(jalali_date_display_from_iso(iso_date))
+        selected_reference_id = self.reference_selector_combo.currentData()
+        if selected_reference_id:
+            reference = self._get_reference_info(selected_reference_id)
+            if not reference:
+                return
+            reference_no = reference['reference_no']
+            stage_no = self.repository.peek_stage_no(selected_reference_id)
+            document_no = self.repository.peek_document_no(
+                reference_no, stage_no, personnel_id=self.customer_combo.currentData())
+            remaining = int(reference['remaining_qty'])
+            self.reference_no_label.setText(reference_no)
+            self.document_no_label.setText(document_no)
+            self.stage_no_label.setText(str(stage_no))
+            self.remaining_qty_label.setText(f'{remaining:,} عدد')
+            self.total_declared_edit.setText(self._fmt_int(int(reference['total_load_qty'])))
+            self.total_declared_edit.setEnabled(False)
+        else:
+            reference_no = self.repository.peek_reference_no(iso_date)
+            document_no = self.repository.peek_document_no(
+                reference_no, 1, personnel_id=self.customer_combo.currentData())
+            self.reference_no_label.setText(reference_no)
+            self.document_no_label.setText(document_no)
+            self.stage_no_label.setText('1')
+            self.remaining_qty_label.setText('مرجع جدید')
+            self.total_declared_edit.setEnabled(self.can_manage)
+    def _driver_changed(self) -> None:
+        driver_id = self.driver_combo.currentData()
+        row = next((item for item in self.drivers if item['id'] == driver_id), None)
+
+        vtype = (row.get('vehicle_type') or '') if row else ''
+        vplate = (row.get('vehicle_plate') or '') if row else ''
+
+        if not vtype and not vplate:
+            ref_id = self.reference_selector_combo.currentData()
+            if ref_id:
+                try:
+                    with self.db.connect() as conn:
+                        conn.row_factory = None
+                        r = conn.execute(
+                            "SELECT COALESCE(vehicle_type, ''), COALESCE(vehicle_plate, '') "
+                            "FROM outbound_loads WHERE id = ?",
+                            (ref_id,)
+                        ).fetchone()
+                        if r:
+                            vtype, vplate = r[0] or '', r[1] or ''
+                except Exception:
+                    pass
+
+        self.vehicle_label.setText("{} | {}".format(vtype or '-', vplate or '-'))
+
+    # ------------------------------------------------------------------
+    # Lines table
+    # ------------------------------------------------------------------
+    def _refresh_pallet_combos(self) -> None:
+        for row in range(self.lines_table.rowCount()):
+            combo = self.lines_table.cellWidget(row, 1)
+            if not isinstance(combo, QComboBox):
+                continue
+
+            current_id = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem('انتخاب پالت', None)
+
+            for p, s, a in self._pallet_options_for_warehouse():
+                txt = "{} | {} (موجودی آزاد: {:,})".format(p['code'], p['name'], s)
+                if a > 0:
+                    txt += " | میانگین: {:,}".format(a)
+                combo.addItem(txt, p['id'])
+
+            if current_id:
+                idx = combo.findData(current_id)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+            combo.blockSignals(False)
+
+    def add_line_row(self) -> None:
+        row = self.lines_table.rowCount()
+        self.lines_table.insertRow(row)
+
+        no_item = QTableWidgetItem(str(row + 1))
+        no_item.setFlags(no_item.flags() & ~Qt.ItemIsEditable)
+        no_item.setTextAlignment(Qt.AlignCenter)
+        self.lines_table.setItem(row, 0, no_item)
+
+        pallet_combo = QComboBox()
+        pallet_combo.addItem('انتخاب پالت', None)
+
+        for item, s, a in self._pallet_options_for_warehouse():
+            txt = "{} | {} (موجودی آزاد: {:,})".format(item['code'], item['name'], s)
+            if a > 0:
+                txt += " | میانگین: {:,}".format(a)
+            pallet_combo.addItem(txt, item['id'])
+
+        r = row
+        pallet_combo.currentIndexChanged.connect(lambda _, row=r: self._on_issue_pallet_changed(row))
+
+        qty_spin = QSpinBox()
+        qty_spin.setRange(0, 100000000)
+        qty_spin.valueChanged.connect(self.recalculate_lines)
+
+        unit_price_edit = QLineEdit()
+        unit_price_edit.textChanged.connect(lambda: self._handle_price_edit_change(unit_price_edit))
+
+        total_item = QTableWidgetItem('0')
+        total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
+        total_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        defect_edit = QLineEdit()
+        defect_edit.setPlaceholderText('عیب یا توضیح ردیف')
+
+        self.lines_table.setCellWidget(row, 1, pallet_combo)
+        self.lines_table.setCellWidget(row, 2, qty_spin)
+        self.lines_table.setCellWidget(row, 3, unit_price_edit)
+        self.lines_table.setItem(row, 4, total_item)
+        self.lines_table.setCellWidget(row, 5, defect_edit)
+
+        self.recalculate_lines()
+
+    def remove_selected_line(self) -> None:
+        row = self.lines_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'ردیف‌ها', 'ابتدا یک ردیف را انتخاب کنید.')
+            return
+
+        self.lines_table.removeRow(row)
+
+        for index in range(self.lines_table.rowCount()):
+            item = self.lines_table.item(index, 0)
+            if item:
+                item.setText(str(index + 1))
+
+        if self.lines_table.rowCount() == 0:
+            self.add_line_row()
+
+        self.recalculate_lines()
+
+    def recalculate_lines(self) -> None:
+        grand_total = 0
+        grand_qty = 0
+
+        for row in range(self.lines_table.rowCount()):
+            qty_widget = self.lines_table.cellWidget(row, 2)
+            price_widget = self.lines_table.cellWidget(row, 3)
+
+            qty = qty_widget.value() if isinstance(qty_widget, QSpinBox) else 0
+            unit_price = self._int_from_text(price_widget.text()) if isinstance(price_widget, QLineEdit) else 0
+
+            total = qty * unit_price
+            grand_total += total
+            grand_qty += qty
+
+            item = self.lines_table.item(row, 4)
+            if item:
+                item.setText(self._fmt_int(total))
+
+        self.lines_total_label.setText('جمع ریالی ردیف‌ها: {} ریال'.format(self._fmt_int(grand_total)))
+
+        if not self.delivered_edit.hasFocus() and grand_qty > 0:
+            self.delivered_edit.setText(self._fmt_int(grand_qty))
+
+        self._on_quantity_changed()
+        self._recalc_final_total()
+
+    def _on_issue_pallet_changed(self, row: int) -> None:
+        pallet_combo = self.lines_table.cellWidget(row, 1)
+        if not isinstance(pallet_combo, QComboBox):
+            return
+
+        pallet_id = pallet_combo.currentData()
+        qty_spin = self.lines_table.cellWidget(row, 2)
+        price_edit = self.lines_table.cellWidget(row, 3)
+
+        if pallet_id:
+            wid = self.warehouse_combo.currentData() if hasattr(self, 'warehouse_combo') else None
+            avg_price = self._avg_price_for_warehouse(pallet_id, wid) or int(self.avg_pallet_prices.get(pallet_id, 0) or 0)
+
+            self.avg_price_value.setText("{} ریال".format(self._fmt_int(avg_price)))
+
+            sa = self._sale_avg_for_pallet(pallet_id)
+            self.sale_avg_value.setText("{} ریال".format(self._fmt_int(sa)) if sa else '-')
+
+            if hasattr(self, 'issue_calc_val'):
+                self._issue_recalc_percent()
+
+            ref_id = self.reference_selector_combo.currentData() if hasattr(self, 'reference_selector_combo') else None
+            avail = self._available_for_warehouse(pallet_id, wid, ref_id) if wid else int(self.pallet_stock.get(pallet_id, 0) or 0)
+            if isinstance(qty_spin, QSpinBox):
+                qty_spin.setMaximum(max(avail, 1))
+
+            if isinstance(price_edit, QLineEdit):
+                _d = ''.join(ch for ch in self.issue_pct_edit.text() if ch.isdigit())
+                _pct = float(_d) if _d else 0.0
+                _suggested = int(avg_price * (1 + _pct / 100.0))
+                price_edit.blockSignals(True)
+                price_edit.setText(self._fmt_int(_suggested))
+                price_edit.blockSignals(False)
+        else:
+            self.avg_price_value.setText('0 ریال')
+            self.sale_avg_value.setText('-')
+
+        if hasattr(self, 'issue_pct_edit'):
+            self.issue_pct_edit.clear()
+            self.issue_calc_val.setText('-')
+
+        self.recalculate_lines()
+
+    def _setup_lines_table_layout(self) -> None:
+        tbl = self.lines_table
+        header = tbl.horizontalHeader()
+        header.setMinimumSectionSize(40)
+        header.setStretchLastSection(False)
+
+        widths = {0: 45, 1: 260, 2: 85, 3: 130, 4: 130}
+        for col, w in widths.items():
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+            tbl.setColumnWidth(col, w)
+
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        tbl.verticalHeader().setDefaultSectionSize(34)
+        tbl.setWordWrap(False)
+
+    # ------------------------------------------------------------------
+    # Load existing reference lines
+    # ------------------------------------------------------------------
+    def _load_issue_items(self, outbound_load_id: int) -> None:
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                items = conn.execute(
+                    "SELECT wii.pallet_id, p.code, p.name, wii.qty, wii.unit_price, wii.total_price, "
+                    "wii.warehouse_id, wii.defect_description "
+                    "FROM warehouse_issue_items wii "
+                    "JOIN pallets p ON p.id = wii.pallet_id "
+                    "JOIN warehouse_issues wi ON wi.id = wii.issue_id "
+                    "WHERE wi.outbound_load_id = ? ORDER BY wii.row_no",
+                    (outbound_load_id,)
+                ).fetchall()
+
+                if not items:
+                    return
+
+                self.lines_table.setRowCount(0)
+
+                for idx, item in enumerate(items):
+                    row = self.lines_table.rowCount()
+                    self.lines_table.insertRow(row)
+
+                    no_item = QTableWidgetItem(str(idx + 1))
+                    no_item.setFlags(no_item.flags() & ~Qt.ItemIsEditable)
+                    no_item.setTextAlignment(Qt.AlignCenter)
+                    self.lines_table.setItem(row, 0, no_item)
+
+                    pallet_combo = QComboBox()
+                    pallet_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                    pallet_combo.setMinimumContentsLength(6)
+                    pallet_combo.addItem('انتخاب پالت', None)
+
+                    for p in self._pallet_options(extra_id=item[0]):
+                        pallet_combo.addItem("{} | {}".format(p['code'], p['name']), p['id'])
+                        if p['id'] == item[0]:
+                            pallet_combo.setCurrentIndex(pallet_combo.count() - 1)
+
+                    r = row
+                    pallet_combo.currentIndexChanged.connect(lambda _, row=r: self._on_issue_pallet_changed(row))
+                    self.lines_table.setCellWidget(row, 1, pallet_combo)
+
+                    qty_spin = QSpinBox()
+                    qty_spin.setRange(0, 100000000)
+                    qty_spin.setValue(int(item[3] or 0))
+                    qty_spin.valueChanged.connect(self.recalculate_lines)
+                    self.lines_table.setCellWidget(row, 2, qty_spin)
+
+                    price_edit = QLineEdit(self._fmt_int(int(item[4] or 0)))
+                    price_edit.textChanged.connect(lambda: self._handle_price_edit_change(price_edit))
+                    self.lines_table.setCellWidget(row, 3, price_edit)
+
+                    total_item = QTableWidgetItem(self._fmt_int(int(item[5] or 0)))
+                    total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
+                    total_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.lines_table.setItem(row, 4, total_item)
+
+                    defect_edit = QLineEdit(item[7] or '')
+                    self.lines_table.setCellWidget(row, 5, defect_edit)
+
+                    self._on_issue_pallet_changed(row)
+
+                self.recalculate_lines()
+
+        except Exception as e:
+            print('Load items error:', str(e))
+
+    def _load_reference_pallet_lines(self, outbound_load_id: int) -> None:
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                rows = conn.execute(
+                    "SELECT oli.pallet_id, oli.qty, oli.unit_price, "
+                    " (SELECT il.warehouse_id FROM inventory_levels il "
+                    "  WHERE il.pallet_id = oli.pallet_id AND il.quantity > 0 "
+                    "  ORDER BY il.quantity DESC LIMIT 1) AS wh_id "
+                    "FROM outbound_load_items oli "
+                    "WHERE oli.outbound_load_id = ? ORDER BY oli.row_no",
+                    (outbound_load_id,)
+                ).fetchall()
+        except Exception:
+            rows = []
+
+        grouped = {}
+        for r in rows:
+            k = r[0]
+            if k in grouped:
+                grouped[k] = (k, (grouped[k][1] or 0) + (r[1] or 0), grouped[k][2], grouped[k][3])
+            else:
+                grouped[k] = (k, r[1] or 0, r[2], r[3])
+
+        rows = list(grouped.values())
+        if not rows:
+            return
+
+        for r in range(self.lines_table.rowCount()):
+            combo = self.lines_table.cellWidget(r, 1)
+            if isinstance(combo, QComboBox) and combo.currentData():
+                return
+
+        self.lines_table.setRowCount(0)
+
+        try:  # PALQFIX
+            with self.db.connect() as _rc:
+                _rr = _rc.execute("SELECT COALESCE(remaining_qty,0) FROM outbound_loads WHERE id=?", (outbound_load_id,)).fetchone()
+                _rem = int(_rr[0] or 0) if _rr else 0
+        except Exception:
+            _rem = 0
+        for item in rows:
+            row = self.lines_table.rowCount()
+            self.lines_table.insertRow(row)
+
+            no_item = QTableWidgetItem(str(row + 1))
+            no_item.setFlags(no_item.flags() & ~Qt.ItemIsEditable)
+            no_item.setTextAlignment(Qt.AlignCenter)
+            self.lines_table.setItem(row, 0, no_item)
+
+            pallet_combo = QComboBox()
+            pallet_combo.addItem('انتخاب پالت', None)
+
+            for p in self._pallet_options(extra_id=item[0]):
+                pallet_combo.addItem("{} | {}".format(p['code'], p['name']), p['id'])
+                if p['id'] == item[0]:
+                    pallet_combo.setCurrentIndex(pallet_combo.count() - 1)
+
+            r = row
+            pallet_combo.currentIndexChanged.connect(lambda _, row=r: self._on_issue_pallet_changed(row))
+            self.lines_table.setCellWidget(row, 1, pallet_combo)
+
+            qty_spin = QSpinBox()
+            qty_spin.setRange(0, 100000000)
+            qty_spin.setValue(min(int(item[1] or 0), _rem))  # PALQFIX
+            qty_spin.valueChanged.connect(self.recalculate_lines)
+            self.lines_table.setCellWidget(row, 2, qty_spin)
+
+            price_edit = QLineEdit(self._fmt_int(int(item[2] or 0)))
+            price_edit.textChanged.connect(lambda: self._handle_price_edit_change(price_edit))
+            self.lines_table.setCellWidget(row, 3, price_edit)
+
+            total_item = QTableWidgetItem('0')
+            total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
+            total_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.lines_table.setItem(row, 4, total_item)
+
+            defect_edit = QLineEdit()
+            defect_edit.setPlaceholderText('عیب یا توضیح ردیف')
+            self.lines_table.setCellWidget(row, 5, defect_edit)
+
+            self._on_issue_pallet_changed(row)
+
+        self.recalculate_lines()
+
+    # ------------------------------------------------------------------
+    # Amount / quantity helpers
+    # ------------------------------------------------------------------
+    def _handle_price_edit_change(self, edit: QLineEdit) -> None:
+        self._format_line_edit_number(edit)
+        self.recalculate_lines()
+
+    def _format_line_edit_number(self, edit: QLineEdit) -> None:
+        digits = ''.join(ch for ch in edit.text() if ch.isdigit())
+        edit.blockSignals(True)
+        edit.setText(self._fmt_int(int(digits)) if digits else '')
+        edit.blockSignals(False)
+
+    def _format_extra_costs_edit(self):
+        edit = self.extra_costs_edit
+        digits = ''.join(ch for ch in edit.text() if ch.isdigit())
+        edit.blockSignals(True)
+        edit.setText(self._fmt_int(int(digits)) if digits else '')
+        edit.blockSignals(False)
+        self._recalc_final_total()
+
+    def _on_quantity_changed(self) -> None:
+        for edit in [self.total_declared_edit, self.stage_declared_edit, self.delivered_edit]:
+            self._format_line_edit_number(edit)
+
+        total = self._int_from_text(self.stage_declared_edit.text())
+        delivered = self._int_from_text(self.delivered_edit.text())
+        self.discrepancy_label.setText(self._fmt_int(max(total - delivered, 0)))
+
+    def _fmt_int(self, value: int) -> str:
+        return '{:,}'.format(int(value))
+
+    def _int_from_text(self, value: str) -> int:
+        digits = ''.join(ch for ch in str(value) if ch.isdigit())
+        return int(digits) if digits else 0
+
+    def _lines_subtotal(self) -> int:
+        total = 0
+        for row in range(self.lines_table.rowCount()):
+            qty_widget = self.lines_table.cellWidget(row, 2)
+            price_widget = self.lines_table.cellWidget(row, 3)
+
+            qty = qty_widget.value() if isinstance(qty_widget, QSpinBox) else 0
+            unit_price = self._int_from_text(price_widget.text()) if isinstance(price_widget, QLineEdit) else 0
+
+            total += qty * unit_price
+        return total
+
+    def _current_vat_amount(self) -> int:
+        if not self.vat_checkbox.isChecked():
+            return 0
+        return int(self._lines_subtotal() * 9 / 100)
+
+    def _current_extra_costs(self) -> int:
+        if not self.extra_checkbox.isChecked():
+            return 0
+        return self._int_from_text(self.extra_costs_edit.text())
+
+    def _recalc_final_total(self):
+        subtotal = self._lines_subtotal()
+        vat = self._current_vat_amount()
+        extra = self._current_extra_costs()
+
+        self.vat_amount_label.setText('{} ریال'.format(self._fmt_int(vat)))
+
+        final = subtotal + vat + extra
+        self.final_total_label.setText('قیمت نهایی: {} ریال'.format(self._fmt_int(final)))
+
+    def _on_extra_toggled(self):
+        self.extra_costs_edit.setEnabled(self.extra_checkbox.isChecked())
+        if self.extra_checkbox.isChecked():
+            self.extra_costs_edit.setFocus()
+        self._recalc_final_total()
+
+    def _issue_recalc_percent(self):
+        try:
+            pct_text = self.issue_pct_edit.text().strip()
+            if not pct_text:
+                self.issue_calc_val.setText('-')
+                return
+
+            digits = ''.join(ch for ch in pct_text if ch.isdigit())
+            if not digits:
+                self.issue_calc_val.setText('-')
+                return
+
+            pct = float(digits)
+
+            avg_text = self.avg_price_value.text().replace(' ریال', '').replace(',', '').strip()
+            try:
+                avg = int(float(avg_text))
+            except Exception:
+                avg = 0
+
+            if avg <= 0:
+                self.issue_calc_val.setText('-')
+                return
+
+            calc = int(avg * (1 + pct / 100.0))
+            self.issue_calc_val.setText('{:,} ریال (+{}%)'.format(calc, int(pct)))
+            if hasattr(self, 'issue_margin_lbl'):
+                self.issue_margin_lbl.setText('حاشیه سود روی فروش: {:.1f}%'.format(pct / (100.0 + pct) * 100.0 if pct > 0 else 0))
+
+        except Exception:
+            self.issue_calc_val.setText('-')
+
+    # ------------------------------------------------------------------
+    # Collect form data
+    # ------------------------------------------------------------------
+    def _collect_lines(self) -> List[Dict[str, Any]]:
+        lines: List[Dict[str, Any]] = []
+        wid = self.warehouse_combo.currentData() if hasattr(self, 'warehouse_combo') else None
+
+        for row in range(self.lines_table.rowCount()):
+            pallet_widget = self.lines_table.cellWidget(row, 1)
+            qty_widget = self.lines_table.cellWidget(row, 2)
+            price_widget = self.lines_table.cellWidget(row, 3)
+            defect_widget = self.lines_table.cellWidget(row, 5)
+
+            qty = qty_widget.value() if isinstance(qty_widget, QSpinBox) else 0
+            unit_text = price_widget.text() if isinstance(price_widget, QLineEdit) else '0'
+
+            lines.append({
+                'pallet_id': pallet_widget.currentData() if isinstance(pallet_widget, QComboBox) else None,
+                'quantity': qty,
+                'unit_price': unit_text,
+                'warehouse_id': wid,
+                'defect_notes': defect_widget.text() if isinstance(defect_widget, QLineEdit) else '',
+                'description': '',
+                'line_total_amount': qty * self._int_from_text(unit_text)
+            })
+
+        return lines
+
+    def _collect_payload(self) -> Dict[str, Any]:
+        return {
+            'outbound_load_id': self.reference_selector_combo.currentData(),
+            'operation_date': self._current_iso_date(),
+            'customer_person_id': self.customer_combo.currentData(),
+            'driver_person_id': self.driver_combo.currentData(),
+            'total_declared_qty': self.total_declared_edit.text(),
+            'stage_declared_qty': self.stage_declared_edit.text(),
+            'delivered_qty': self.delivered_edit.text(),
+            'freight_amount': self.freight_edit.text(),
+            'waybill_no': self.waybill_edit.text(),
+            'source_location': self.source_location_edit.text(),
+            'destination_location': self.destination_location_edit.text(),
+            'warehouse_keeper_name': self.warehouse_keeper_edit.text(),
+            'receiver_name': self.receiver_name_edit.text(),
+            'notes': self.notes_edit.toPlainText(),
+            'lines': self._collect_lines(),
+            'vat_enabled': self.vat_checkbox.isChecked(),
+            'vat_amount': self._current_vat_amount(),
+            'extra_costs': self._current_extra_costs(),
+        }
+
+    def _select_combo_by_data(self, combo: QComboBox, value: Any) -> None:
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
+        combo.setCurrentIndex(0)
+
+    def _current_iso_date(self) -> str:
+        return self.operation_date_edit.date().toString('yyyy-MM-dd')
+
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
+    def _build_preview_context_from_form(self) -> Dict[str, Any]:
+        payload = self._collect_payload()
+
+        customer_text = self.customer_combo.currentText() or '-'
+        driver_text = self.driver_combo.currentText().split('|')[0].strip() or '-'
+        vehicle_parts = [part.strip() for part in (self.vehicle_label.text() or '-').split('|', 1)]
+
+        warehouse_text = self.warehouse_combo.currentText() if hasattr(self, 'warehouse_combo') else '-'
+        warehouse_name = warehouse_text.split('|', 1)[1].strip() if '|' in warehouse_text else warehouse_text
+
+        lines = []
+        for idx in range(self.lines_table.rowCount()):
+            pallet_widget = self.lines_table.cellWidget(idx, 1)
+            qty_widget = self.lines_table.cellWidget(idx, 2)
+            price_widget = self.lines_table.cellWidget(idx, 3)
+            defect_widget = self.lines_table.cellWidget(idx, 5)
+
+            pallet_text = pallet_widget.currentText() if isinstance(pallet_widget, QComboBox) else '-'
+            qty = qty_widget.value() if isinstance(qty_widget, QSpinBox) else 0
+            unit_price = self._int_from_text(price_widget.text()) if isinstance(price_widget, QLineEdit) else 0
+
+            lines.append({
+                'row_no': idx + 1,
+                'pallet_code': pallet_text.split('|')[0].strip() if '|' in pallet_text else pallet_text,
+                'pallet_name': pallet_text.split('|', 1)[1].strip() if '|' in pallet_text else pallet_text,
+                'quantity': qty,
+                'unit_price': unit_price,
+                'total_amount': qty * unit_price,
+                'warehouse_name': warehouse_name or '-',
+                'defect_description': (defect_widget.text() if isinstance(defect_widget, QLineEdit) else '') or '-'
+            })
+
+        return {
+            'reference_no': self.reference_no_label.text(),
+            'issue_no': self.document_no_label.text(),
+            'stage_no': int(self.stage_no_label.text() or '1'),
+            'operation_date_iso': payload['operation_date'],
+            'operation_date_jalali': jalali_date_display_from_iso(payload['operation_date']),
+            'waybill_no': payload.get('waybill_no') or '-',
+            'customer_name': customer_text,
+            'driver_name': driver_text,
+            'vehicle_type': vehicle_parts[0] if vehicle_parts else '-',
+            'vehicle_plate': vehicle_parts[1] if len(vehicle_parts) > 1 else '-',
+            'source_location': payload.get('source_location') or '-',
+            'destination_location': payload.get('destination_location') or '-',
+            'total_declared_qty': self._int_from_text(payload.get('total_declared_qty', '0')),
+            'total_load_qty': self._int_from_text(payload.get('stage_declared_qty', '0')),
+            'delivered_qty': self._int_from_text(payload.get('delivered_qty', '0')),
+            'discrepancy_qty': max(
+                self._int_from_text(payload.get('stage_declared_qty', '0')) -
+                self._int_from_text(payload.get('delivered_qty', '0')),
+                0
+            ),
+            'freight_amount': self._int_from_text(payload.get('freight_amount', '0')),
+            'lines_total_amount': sum(item['total_amount'] for item in lines),
+            'warehouse_keeper_name': payload.get('warehouse_keeper_name') or '-',
+            'receiver_name': payload.get('receiver_name') or '-',
+            'notes': payload.get('notes') or '-',
+            'lines': lines
+        }
+
+    def preview_current_issue(self) -> None:
+        try:
+            html = self.repository.render_issue_html(self._build_preview_context_from_form())
+        except Exception as exc:
+            QMessageBox.warning(self, 'پیش‌نمایش حواله', str(exc))
+            return
+
+        self._open_html_in_browser(html)
+
+    def preview_selected_saved_issue(self) -> None:
+        row = self.issues_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'پیش‌نمایش', 'ابتدا یک حواله را از جدول انتخاب کنید.')
+            return
+
+        item = self.issues_table.item(row, 0)
+        if not item:
+            return
+
+        try:
+            html = self.repository.render_saved_issue_html(int(item.text()))
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', str(exc))
+            return
+
+        if not html:
+            QMessageBox.information(self, 'پیش‌نمایش', 'پیش‌نمایش این سند در دسترس نیست.')
+            return
+
+        self._open_html_in_browser(html)
+
+    def _open_html_in_browser(self, html: str) -> None:  # DLG-FINAL
+        try:
+            from app.ui.webengine_preview import HtmlPreviewDialog
+        except ImportError:
+            from app.ui.html_preview_dialog import HtmlPreviewDialog
+        
+        dlg = HtmlPreviewDialog(html, 'پیش‌نمایش حواله خروج', self)
+        dlg._preview_no_wrap = True  # جلوگیری از فشرده‌سازی و خرابی اسکرول لپ‌تاپ
+        dlg.exec_()
+
+
+    def _old_open_html_disabled(self, html: str) -> None:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+            f.write(html)
+            temp_file = f.name
+
+        webbrowser.open('file:///' + temp_file)
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    def _reserve_qty_map(self):
+        """جمع تعداد رزروشده در پیش‌فاکتورهای تبدیل‌نشده (DRAFT/FINALIZED)"""
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                rows = conn.execute(
+                    "SELECT pii.pallet_id, SUM(pii.quantity) "
+                    "FROM proforma_invoice_items pii "
+                    "JOIN proforma_invoices pi ON pi.id = pii.proforma_id "
+                    "WHERE pi.status IN ('DRAFT','FINALIZED') "
+                    "GROUP BY pii.pallet_id"
+                ).fetchall()
+                return {r[0]: int(r[1] or 0) for r in rows}
+        except Exception:
+            return {}
+
+    def _reference_remaining_qty_map(self, exclude_reference_id=None):
+        """[RESERVE-REF] ماندهٔ متعهدشدهٔ مرجع‌های باز به تفکیک پالت"""
+        res = {}
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                rows = conn.execute(
+                    "SELECT oli.pallet_id, "
+                    "       SUM(oli.qty) - COALESCE((SELECT SUM(wii.qty) "
+                    "           FROM warehouse_issue_items wii "
+                    "           JOIN warehouse_issues wi ON wi.id = wii.issue_id "
+                    "           WHERE wi.outbound_load_id = oli.outbound_load_id "
+                    "             AND wii.pallet_id = oli.pallet_id "
+                    "             AND wi.issue_status != 'CANCELLED'), 0) "
+                    "FROM outbound_load_items oli "
+                    "JOIN outbound_loads ol ON ol.id = oli.outbound_load_id "
+                    "WHERE ol.is_active = 1 AND COALESCE(ol.remaining_qty,0) > 0 AND ol.id != ? "
+                    "GROUP BY oli.outbound_load_id, oli.pallet_id",
+                    (exclude_reference_id or 0,)
+                ).fetchall()
+                for pid, rem in rows:
+                    rem = int(rem or 0)
+                    if rem > 0:
+                        res[pid] = res.get(pid, 0) + rem
+        except Exception:
+            pass
+        return res
+
+    def _committed_qty_map(self, exclude_reference_id=None):
+        """[RESERVE] کل تعهدات = پیش‌فاکتورهای باز + ماندهٔ مرجع‌های باز"""
+        res = dict(self._reserve_qty_map())
+        for pid, q in self._reference_remaining_qty_map(exclude_reference_id).items():
+            res[pid] = res.get(pid, 0) + q
+        return res
+
+    def _available_for_warehouse(self, pallet_id, warehouse_id, exclude_reference_id=None):
+        return int(self._stock_for_warehouse(pallet_id, warehouse_id)) - int(self._committed_qty_map(exclude_reference_id).get(pallet_id, 0))
+
+    def save_issue(self) -> None:
+        self._ac_save_all()
+
+        if not self.can_manage:
+            QMessageBox.warning(self, 'عدم دسترسی', 'شما اجازه ثبت حواله را ندارید.')
+            return
+
+        if hasattr(self, 'warehouse_combo') and not self.warehouse_combo.currentData():
+            QMessageBox.warning(self, 'خطا', 'ابتدا انبار مبدأ را انتخاب کنید.')
+            return
+
+        # [RESERVE] کنترل رزرو: درخواست حواله نباید از موجودی آزاد عبور کند
+        try:
+            _wid = self.warehouse_combo.currentData() if hasattr(self, 'warehouse_combo') else None
+            _reserved = self._committed_qty_map(self.reference_selector_combo.currentData() if hasattr(self, 'reference_selector_combo') else None)
+            _req = {}
+            for _ln in self._collect_lines():
+                _pid = _ln.get('pallet_id')
+                if _pid:
+                    _req[_pid] = _req.get(_pid, 0) + int(_ln.get('quantity', 0) or 0)
+            _short = []
+            for _pid, _q in _req.items():
+                _physical = self._stock_for_warehouse(_pid, _wid)
+                _res = int(_reserved.get(_pid, 0))
+                _avail = _physical - _res
+                if _q > _avail:
+                    _code = next((p['code'] for p in self.pallets if p['id'] == _pid), _pid)
+                    _short.append('پالت {}: موجودی {:,} | رزروشده {:,} | آزاد {:,} | درخواست {:,}'.format(
+                        _code, _physical, _res, _avail, _q))
+            if _short:
+                QMessageBox.warning(self, 'موجودی آزاد کافی نیست',
+                    'جمع این حواله و پیش‌فاکتورهای باز بیش از موجودی است:\n' + '\n'.join(_short))
+                return
+        except Exception:
+            pass
+        try:
+            from app.repositories.fiscal_period_repository import FiscalPeriodRepository
+            locked = FiscalPeriodRepository(self.db).locked_period(self._current_iso_date())
+            if locked:
+                QMessageBox.warning(
+                    self,
+                    'دورهٔ مالی بسته',
+                    f'تاریخ داخل دورهٔ بستهٔ «{locked["name"]}» است. ابتدا بازگشایی کنید.'
+                )
+                return
+        except Exception:
+            pass
+
+        try:
+            saved = self.repository.create_outbound_issue(
+                self._collect_payload(),
+                user_id=self.user_data.get('id')
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', 'ثبت حواله با خطا مواجه شد:\n{}'.format(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            'حواله ثبت شد',
+            "حواله با موفقیت ثبت و تایید شد.\nشماره مرجع: {}\nشماره حواله: {}".format(
+                saved.get('reference_no'),
+                saved.get('issue_no')
+            )
+        )
+
+        try:
+            from app.core.doc_upload_helper import open_upload_after_save
+            open_upload_after_save(self, 'ISSUE', saved, self.db, self.user_data)
+        except Exception as _img_exc:
+            print('[doc-images] upload error:', _img_exc)
+
+        self._load_lookups()
+        self._load_pallet_prices()
+        self.refresh_issues_final()
+        self.clear_form()
+        self.data_changed.emit()
+
+        if saved.get('print_html'):
+            self._open_html_in_browser(saved['print_html'])
+
+    # ------------------------------------------------------------------
+    # List / details / rollback
+    # ------------------------------------------------------------------
+    def refresh_issues_final(self) -> None:  # ISSUE-TREE-FINAL
+        from app.core.jalali import jalali_date_display_from_iso as _j
+        rows = self.repository.list_issue_tree()
+        tbl = self.issues_table
+        tbl.setColumnCount(11)
+        tbl.setHorizontalHeaderLabels(
+            ['شناسه', 'شماره حواله', 'مرجع مادر', 'انبار', 'تاریخ', 'مشتری', 'راننده',
+             'کل بار', 'خروج', 'مانده', 'وضعیت'])
+        tbl.setColumnHidden(0, True)
+        tbl.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tbl.setRowCount(0)
+        current_load = None
+        for r in rows:
+            if r['load_id'] != current_load:
+                current_load = r['load_id']
+                remaining = max(r['mother_total'] - r['mother_drawn'], 0)
+                m_status = 'بار باطل' if r.get('load_status') == 'CANCELLED' else 'بار مادر'
+                m_values = ['', '▶ ' + (r['mother_no'] or '-'), r['mother_no'] or '-', '-', '-', '-', '-',
+                            '{:,}'.format(r['mother_total']), '{:,}'.format(r['mother_drawn']),
+                            '{:,}'.format(remaining), m_status]
+                pr = tbl.rowCount()
+                tbl.insertRow(pr)
+                for c, v in enumerate(m_values):
+                    it = QTableWidgetItem(str(v))
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    f = it.font(); f.setBold(True); it.setFont(f)
+                    it.setForeground(QColor('#ef4444'))
+                    tbl.setItem(pr, c, it)
+            if not r['issue_id']:
+                continue
+            status = r['issue_status'] or 'CONFIRMED'
+            status_text = 'باطل' if status == 'CANCELLED' else 'تایید شده'
+            c_values = [str(r['issue_id']), r['issue_no'] or '-', r['mother_no'] or '-', r['warehouses'] or '-',
+                        _j(r['issue_date']) if r['issue_date'] else '-', r['customer'] or '-', r['driver'] or '-',
+                        '', '{:,}'.format(r['issue_qty']), '', status_text]
+            cr = tbl.rowCount()
+            tbl.insertRow(cr)
+            for c, v in enumerate(c_values):
+                it = QTableWidgetItem(str(v))
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                tbl.setItem(cr, c, it)
+        tbl.resizeColumnsToContents()
+
+
+    def refresh_recent_issues(self) -> None:  # ISSUE-LIST-FLAT2
+        self.setWindowTitle('ISSUE-LIST: OLD')  # TRACE-OLD
+        from app.core.jalali import jalali_date_display_from_iso as _j
+        rows = self.repository.list_issue_tree()
+        tbl = self.issues_table
+        tbl.setColumnCount(11)
+        tbl.setHorizontalHeaderLabels(
+            ['شناسه', 'شماره حواله', 'مرجع مادر', 'انبار', 'تاریخ', 'مشتری', 'راننده',
+             'کل بار', 'خروج', 'مانده', 'وضعیت'])
+        tbl.setColumnHidden(0, True)
+        tbl.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tbl.setRowCount(0)
+        for r in rows:
+            if not r['issue_id']:
+                continue
+            remaining = max(r['mother_total'] - r['mother_drawn'], 0)
+            status = r['issue_status'] or 'CONFIRMED'
+            status_text = 'باطل' if status == 'CANCELLED' else 'تایید شده'
+            values = [
+                str(r['issue_id']),
+                r['issue_no'] or '-',
+                r['mother_no'] or '-',
+                r['warehouses'] or '-',
+                _j(r['issue_date']) if r['issue_date'] else '-',
+                r['customer'] or '-',
+                r['driver'] or '-',
+                '{:,}'.format(r['mother_total']),
+                '{:,}'.format(r['issue_qty']),
+                '{:,}'.format(remaining),
+                status_text,
+            ]
+            row_index = tbl.rowCount()
+            tbl.insertRow(row_index)
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                tbl.setItem(row_index, column_index, item)
+        tbl.resizeColumnsToContents()
+
+
+    def _filter_remaining_shipments(self):  # REMAIN-IN-TABLE-V2
+        from app.core.jalali import jalali_date_display_from_iso as _j
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                rows = conn.execute(
+                    "SELECT ol.reference_no, COALESCE(ol.total_load_qty,0), "
+                    "COALESCE((SELECT SUM(wii.qty) FROM warehouse_issue_items wii "
+                    " JOIN warehouse_issues wi ON wi.id=wii.issue_id "
+                    " WHERE wi.outbound_load_id=ol.id AND wi.issue_status!='CANCELLED'),0), "
+                    "COALESCE(p.first_name||' '||p.last_name,'-'), COALESCE(d.first_name||' '||d.last_name,'-'), "
+                    "ol.register_date, COALESCE(w.name,'-') "
+                    "FROM outbound_loads ol "
+                    "LEFT JOIN persons p ON p.id=ol.customer_id "
+                    "LEFT JOIN persons d ON d.id=ol.driver_id "
+                    "LEFT JOIN warehouses w ON w.id=ol.warehouse_id "
+                    "WHERE ol.is_active=1 ORDER BY ol.id DESC").fetchall()
+            tbl = self.issues_table
+            tbl.setColumnCount(11)
+            tbl.setHorizontalHeaderLabels(
+                ['شناسه', 'شماره حواله', 'مرجع مادر', 'انبار', 'تاریخ', 'مشتری', 'راننده',
+                 'کل بار', 'خروج', 'مانده', 'وضعیت'])
+            tbl.setColumnHidden(0, True)
+            tbl.setRowCount(0)
+            shown = 0
+            for r in rows:
+                total = int(r[1] or 0); drawn = int(r[2] or 0)
+                remaining = total - drawn
+                if remaining <= 0:
+                    continue
+                shown += 1
+                values = ['', '▶ ' + (r[0] or '-'), r[0] or '-', r[6] or '-',
+                          _j(r[5]) if r[5] else '-', r[3] or '-', r[4] or '-',
+                          '{:,}'.format(total), '{:,}'.format(drawn), '{:,}'.format(remaining), 'بار مانده']
+                ri = tbl.rowCount()
+                tbl.insertRow(ri)
+                for c, v in enumerate(values):
+                    it = QTableWidgetItem(str(v))
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    f = it.font(); f.setBold(True); it.setFont(f)
+                    it.setForeground(QColor('#f59e0b'))
+                    tbl.setItem(ri, c, it)
+            if shown == 0:
+                QMessageBox.information(self, 'حواله‌های مانده', 'مورد مانده‌ای وجود ندارد.')
+        except Exception as e:
+            QMessageBox.critical(self, 'خطا', str(e))
+
+
+    def _show_issue_details(self) -> None:  # NATIVE-ISSUE-DETAILS-V3
+        from app.core.jalali import jalali_date_display_from_iso as _j
+        row = self.issues_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'جزئیات', 'ابتدا یک حواله را انتخاب کنید.')
+            return
+        item = self.issues_table.item(row, 0)
+        if not item or not item.text().strip().isdigit():
+            QMessageBox.information(self, 'توجه', 'یک ردیف حواله (زیرشاخه) را انتخاب کنید.')
+            return
+        issue_id = int(item.text())
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                iss = conn.execute(
+                    "SELECT wi.issue_no, wi.issue_date, COALESCE(ol.reference_no,'-'), "
+                    "COALESCE(cp.first_name||' '||cp.last_name,'-'), "
+                    "COALESCE(dr.first_name||' '||dr.last_name,'-'), "
+                    "wi.issue_status, COALESCE(ol.total_load_qty,0), COALESCE(wi.freight_amount,0), wi.outbound_load_id "
+                    "FROM warehouse_issues wi "
+                    "LEFT JOIN outbound_loads ol ON ol.id = wi.outbound_load_id "
+                    "LEFT JOIN persons cp ON cp.id = wi.customer_id "
+                    "LEFT JOIN persons dr ON dr.id = wi.driver_id "
+                    "WHERE wi.id=?", (issue_id,)).fetchone()
+                if not iss:
+                    QMessageBox.warning(self, 'خطا', 'حواله یافت نشد.')
+                    return
+                items = conn.execute(
+                    "SELECT wii.row_no, p.code, p.name, wii.qty, wii.unit_price, wii.total_price, "
+                    "COALESCE(w.name,'-'), COALESCE(wii.defect_description,'-') "
+                    "FROM warehouse_issue_items wii "
+                    "JOIN pallets p ON p.id = wii.pallet_id "
+                    "LEFT JOIN warehouses w ON w.id = wii.warehouse_id "
+                    "WHERE wii.issue_id=? ORDER BY wii.row_no", (issue_id,)).fetchall()
+                siblings = []
+                if iss[8]:
+                    siblings = conn.execute(
+                        "SELECT wi2.issue_no, wi2.issue_date, "
+                        "COALESCE((SELECT SUM(wii3.qty) FROM warehouse_issue_items wii3 WHERE wii3.issue_id=wi2.id),0), "
+                        "wi2.issue_status FROM warehouse_issues wi2 "
+                        "WHERE wi2.outbound_load_id=? AND wi2.issue_status!='CANCELLED' ORDER BY wi2.id",
+                        (iss[8],)).fetchall()
+
+            cur_qty = sum(int(it[3] or 0) for it in items)
+            total_amount = sum(int(it[5] or 0) for it in items)
+            mother_total = int(iss[6] or 0)
+            sum_drawn = sum(int(sb[2] or 0) for sb in siblings)
+            remaining = max(mother_total - sum_drawn, 0)
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle('جزئیات: {}'.format(iss[0]))
+            dialog.resize(980, 660)
+            dialog.setLayoutDirection(Qt.RightToLeft)
+            dlg_layout = QVBoxLayout(dialog)
+
+            mother_group = QGroupBox('بار مادر (حواله مادر)')
+            m_layout = QGridLayout(mother_group)
+            m_layout.addWidget(QLabel('مرجع خروج:'), 0, 0)
+            m_layout.addWidget(QLabel(str(iss[2])), 0, 1)
+            m_layout.addWidget(QLabel('کل بار مادر:'), 0, 2)
+            m_layout.addWidget(QLabel('{:,}'.format(mother_total)), 0, 3)
+            m_layout.addWidget(QLabel('جمع خروج‌ها:'), 1, 0)
+            m_layout.addWidget(QLabel('{:,}'.format(sum_drawn)), 1, 1)
+            m_layout.addWidget(QLabel('مانده بار مادر:'), 1, 2)
+            m_layout.addWidget(QLabel('{:,}'.format(remaining)), 1, 3)
+            dlg_layout.addWidget(mother_group)
+
+            info_group = QGroupBox('اطلاعات')
+            info_layout = QGridLayout(info_group)
+            info_layout.addWidget(QLabel('شماره حواله:'), 0, 0)
+            info_layout.addWidget(QLabel(str(iss[0])), 0, 1)
+            info_layout.addWidget(QLabel('تاریخ:'), 0, 2)
+            info_layout.addWidget(QLabel(_j(iss[1]) if iss[1] else '-'), 0, 3)
+            info_layout.addWidget(QLabel('مشتری:'), 1, 0)
+            info_layout.addWidget(QLabel(str(iss[3])), 1, 1)
+            info_layout.addWidget(QLabel('راننده:'), 1, 2)
+            info_layout.addWidget(QLabel(str(iss[4])), 1, 3)
+            info_layout.addWidget(QLabel('وضعیت:'), 2, 0)
+            info_layout.addWidget(QLabel(str(iss[5])), 2, 1)
+            info_layout.addWidget(QLabel('تعداد این حواله:'), 2, 2)
+            info_layout.addWidget(QLabel('{:,}'.format(cur_qty)), 2, 3)
+            info_layout.addWidget(QLabel('مبلغ کل:'), 3, 0)
+            info_layout.addWidget(QLabel('{:,} ریال'.format(total_amount)), 3, 1)
+            info_layout.addWidget(QLabel('پس‌کرایه:'), 3, 2)
+            info_layout.addWidget(QLabel('{:,} ریال'.format(int(iss[7] or 0))), 3, 3)
+            dlg_layout.addWidget(info_group)
+
+            items_table = QTableWidget(0, 8)
+            items_table.setHorizontalHeaderLabels(['ردیف', 'کد پالت', 'نام پالت', 'تعداد', 'قیمت واحد', 'مبلغ کل', 'انبار', 'توضیح'])
+            items_table.verticalHeader().setVisible(False)
+            items_table.setRowCount(len(items))
+            for idx, it in enumerate(items):
+                vals = [str(it[0]), it[1] or '-', it[2] or '-', '{:,}'.format(int(it[3] or 0)),
+                        '{:,}'.format(int(it[4] or 0)), '{:,}'.format(int(it[5] or 0)), it[6], it[7]]
+                for col, v in enumerate(vals):
+                    cell = QTableWidgetItem(str(v))
+                    cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                    items_table.setItem(idx, col, cell)
+            items_table.resizeColumnsToContents()
+            dlg_layout.addWidget(items_table)
+
+            if len(siblings) > 1:
+                sb_group = QGroupBox('حواله‌های صادرشدهٔ این بار')
+                sb_layout = QVBoxLayout(sb_group)
+                sb_table = QTableWidget(0, 4)
+                sb_table.setHorizontalHeaderLabels(['شماره حواله', 'تاریخ', 'تعداد', 'وضعیت'])
+                sb_table.verticalHeader().setVisible(False)
+                sb_table.setRowCount(len(siblings))
+                for si, sb in enumerate(siblings):
+                    sv = [str(sb[0]), _j(sb[1]) if sb[1] else '-', '{:,}'.format(int(sb[2] or 0)), str(sb[3])]
+                    for col, v in enumerate(sv):
+                        cell = QTableWidgetItem(str(v))
+                        cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                        sb_table.setItem(si, col, cell)
+                sb_table.resizeColumnsToContents()
+                sb_layout.addWidget(sb_table)
+                dlg_layout.addWidget(sb_group)
+
+            close_btn = QPushButton('بستن')
+            close_btn.clicked.connect(dialog.accept)
+            dlg_layout.addWidget(close_btn)
+            dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, 'خطا در جزئیات', str(e))
+
+    def rollback_selected_issue(self) -> None:
+        if not self.can_manage:
+            QMessageBox.warning(self, 'عدم دسترسی', 'شما اجازه rollback حواله را ندارید.')
+            return
+
+        row = self.issues_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'rollback حواله', 'ابتدا یک حواله را از جدول انتخاب کنید.')
+            return
+
+        item = self.issues_table.item(row, 0)
+        if not item:
+            return
+
+        if not item.text().strip().isdigit():
+            QMessageBox.information(self, 'توجه', 'یک ردیف حواله (زیرشاخه) را انتخاب کنید.')
+            return
+        issue_id = int(item.text())
+        rollback_items = []
+
+        try:
+            with self.db.connect() as conn:
+                conn.row_factory = None
+                lines = conn.execute(
+                    """
+                    SELECT wii.row_no, wii.pallet_id, wii.qty, wii.unit_price, wii.total_price, wii.warehouse_id,
+                           p.code, p.name, w.name,
+                           (COALESCE((SELECT SUM(o.qty) FROM opening_inventory_items o WHERE o.pallet_id = wii.pallet_id), 0)
+                            + COALESCE((SELECT SUM(CASE WHEN t.transaction_type='IN' THEN t.qty_in ELSE -t.qty_out END)
+                                        FROM inventory_transactions t
+                                        WHERE t.pallet_id = wii.pallet_id
+                                          AND t.warehouse_id = wii.warehouse_id
+                                          AND COALESCE(t.is_void, 0) = 0), 0)) AS current_qty
+                    FROM warehouse_issue_items wii
+                    JOIN pallets p ON p.id = wii.pallet_id
+                    LEFT JOIN warehouses w ON w.id = wii.warehouse_id
+                    WHERE wii.issue_id = ?
+                    ORDER BY wii.row_no
+                    """,
+                    (issue_id,)
+                ).fetchall()
+
+                for line in lines:
+                    current_qty = int(line[9] or 0)
+                    rollback_qty = int(line[2])
+                    rollback_items.append({
+                        'row_no': line[0],
+                        'pallet_code': line[6],
+                        'pallet_name': line[7],
+                        'warehouse_name': line[8] or '-',
+                        'rollback_qty': rollback_qty,
+                        'current_qty': current_qty,
+                        'after_qty': current_qty + rollback_qty,
+                    })
+
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', f'خطا در بررسی موجودی:\n{exc}')
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('پیش‌نمایش ابطال حواله')
+        dialog.resize(900, 600)
+        dialog.setLayoutDirection(Qt.RightToLeft)
+
+        layout = QVBoxLayout(dialog)
+
+        impact_group = QGroupBox('تأثیر ابطال بر موجودی پالت‌ها')
+        impact_layout = QVBoxLayout(impact_group)
+
+        impact_table = QTableWidget(0, 7)
+        impact_table.setHorizontalHeaderLabels(
+            ['ردیف', 'کد پالت', 'نام پالت', 'انبار', 'موجودی فعلی', 'کاهش', 'موجودی پس از ابطال']
+        )
+        impact_table.verticalHeader().setVisible(False)
+        impact_table.setRowCount(len(rollback_items))
+
+        for idx, it in enumerate(rollback_items):
+            vals = [
+                str(it['row_no']),
+                it['pallet_code'],
+                it['pallet_name'],
+                it['warehouse_name'],
+                f"{it['current_qty']:,}",
+                f"+{it['rollback_qty']:,}",
+                f"{it['after_qty']:,}"
+            ]
+            for col, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                impact_table.setItem(idx, col, cell)
+
+        impact_table.resizeColumnsToContents()
+        impact_layout.addWidget(impact_table)
+        layout.addWidget(impact_group)
+
+        btn_layout = QHBoxLayout()
+        cancel_btn = QPushButton('انصراف')
+        cancel_btn.clicked.connect(dialog.reject)
+
+        confirm_btn = QPushButton('تأیید و ابطال')
+        confirm_btn.setObjectName('DangerButton')
+        confirm_btn.clicked.connect(dialog.accept)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(confirm_btn)
+        layout.addLayout(btn_layout)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        try:
+            result = self.repository.rollback_issue(issue_id, user_id=self.user_data.get('id'))
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', f'rollback حواله با خطا مواجه شد:\n{exc}')
+            return
+
+        QMessageBox.information(
+            self,
+            'rollback حواله',
+            result.get('message') or 'حواله با موفقیت ابطال شد.'
+        )
+
+        report_dialog = QDialog(self)
+        report_dialog.setWindowTitle('گزارش ابطال حواله')
+        report_dialog.resize(700, 450)
+        report_dialog.setLayoutDirection(Qt.RightToLeft)
+
+        r_layout = QVBoxLayout(report_dialog)
+
+        ok_lbl = QLabel('✔ عملیات ابطال با موفقیت انجام شد')
+        ok_lbl.setStyleSheet('color:#10b981;font-size:18px;font-weight:bold;')
+        ok_lbl.setAlignment(Qt.AlignCenter)
+        r_layout.addWidget(ok_lbl)
+
+        r_layout.addWidget(QLabel(result.get('message') or ''))
+        r_layout.addWidget(QLabel(f"تعداد کل ابطال: {sum(it['rollback_qty'] for it in rollback_items):,} پالت"))
+
+        summary = 'پالت‌های تحت تأثیر:\n' + '\n'.join(
+            f"  • {it['pallet_code']} ({it['pallet_name']}) در {it['warehouse_name']}: "
+            f"{it['current_qty']:,} → {it['after_qty']:,} ({it['rollback_qty']:,}+)"
+            for it in rollback_items
+        )
+
+        sum_lbl = QLabel(summary)
+        sum_lbl.setWordWrap(True)
+        r_layout.addWidget(sum_lbl)
+
+        note_lbl = QLabel('⚠ اسناد مالی مرتبط ابطال و سند برگشتی روزنامه ثبت شد.')
+        note_lbl.setStyleSheet('color:#f59e0b;')
+        r_layout.addWidget(note_lbl)
+
+        close_btn = QPushButton('بستن')
+        close_btn.clicked.connect(report_dialog.accept)
+        r_layout.addWidget(close_btn)
+
+        report_dialog.exec_()
+
+        self._load_lookups()
+        self._load_pallet_prices()
+        self.refresh_issues_final()
+        self.data_changed.emit()
+
+    # ------------------------------------------------------------------
+    # Theme / clear / UI
+    # ------------------------------------------------------------------
+    def toggle_theme(self):
+        """تغییر بین تم دارک و روشن"""
+        if self.current_theme == "light":
+            self.current_theme = "dark"
+            apply_theme(QApplication.instance(), "dark")
+            QMessageBox.information(self, "تم تغییر کرد", "تم دارک فعال شد 🌙")
+        else:
+            self.current_theme = 'dark'
+            apply_theme(QApplication.instance(), "dark")
+            QMessageBox.information(self, "تم تغییر کرد", "تم روشن فعال شد ☀️")
+
+    def clear_form(self) -> None:
+        if hasattr(self, 'vat_checkbox'):
+            self.vat_checkbox.setChecked(False)
+            self.extra_checkbox.setChecked(False)
+            self.extra_costs_edit.clear()
+            self.extra_costs_edit.setEnabled(False)
+            self.vat_amount_label.setText('۰ ریال')
+            self.final_total_label.setText('قیمت نهایی: ۰ ریال')
+
+        self.allowed_pallet_ids = None
+        self.operation_date_edit.setDate(QDate.fromString(today_iso_date(), 'yyyy-MM-dd'))
+        self.reference_selector_combo.setCurrentIndex(0)
+
+        self.waybill_edit.clear()
+        self.customer_combo.setCurrentIndex(0)
+        self.driver_combo.setCurrentIndex(0)
+        self.total_declared_edit.clear()
+        self.stage_declared_edit.clear()
+        self.delivered_edit.clear()
+        self.freight_edit.clear()
+        self.source_location_edit.clear()
+        self.destination_location_edit.clear()
+        self.warehouse_keeper_edit.clear()
+        self.receiver_name_edit.clear()
+        self.notes_edit.clear()
+        self.vehicle_label.setText('-')
+
+        self.lines_table.setRowCount(0)
+
+        if hasattr(self, 'warehouse_combo'):
+            self.warehouse_combo.setEnabled(True)
+            self.warehouse_combo.setCurrentIndex(0)
+            self.warehouse_msg_lbl.show()
+
+        self.add_line_row()
+        self.avg_price_value.setText('0 ریال')
+
+        self._load_lookups()
+        self._load_pallet_prices()
+        self._refresh_pallet_combos()
+        self._refresh_reference_numbers()
+        self._on_quantity_changed()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.setWindowState(Qt.WindowMaximized)
+
+    def _setup_autocomplete(self) -> None:
+        try:
+            from app.core.auto_complete import AutoCompleteStore, attach_autocomplete, install_window_shortcuts
+        except Exception as exc:
+            print('[auto-complete] import error:', exc)
+            return
+
+        try:
+            self._ac_store = AutoCompleteStore()
+            self._ac_filters = {}
+
+            fields = [
+                (self.waybill_edit, 'waybill_no'),
+                (self.source_location_edit, 'source_location'),
+                (self.destination_location_edit, 'destination_location'),
+                (self.warehouse_keeper_edit, 'warehouse_keeper'),
+                (self.receiver_name_edit, 'receiver_name'),
+                (self.notes_edit, 'notes'),
+            ]
+
+            for widget, key in fields:
+                self._ac_filters[widget] = attach_autocomplete(self._ac_store, widget, key)
+
+            install_window_shortcuts(self, self._ac_filters)
+
+        except Exception as exc:
+            print('[auto-complete] setup error:', exc)
+
+    def _ac_save_all(self) -> None:
+        for flt in getattr(self, '_ac_filters', {}).values():
+            try:
+                flt.save_now()
+            except Exception:
+                pass
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        header = QFrame()
+        header.setObjectName('Card')
+        header_layout = QVBoxLayout(header)
+
+        title = QLabel('مدیریت حواله خروج انبار')
+        title.setObjectName('Title')
+
+        subtitle = QLabel('شماره‌گذاری خودکار حواله خروج و پشتیبانی از خروج مرحله‌ای از پیش‌فاکتور')
+        subtitle.setObjectName('Muted')
+
+        header_layout.addWidget(title)
+        header_layout.addWidget(subtitle)
+        root.addWidget(header)
+
+        wh_group = QGroupBox('انتخاب انبار مبدأ')
+        whl = QVBoxLayout(wh_group)
+
+        wtop = QHBoxLayout()
+        wtop.addWidget(QLabel('انبار:'))
+
+        self.warehouse_combo = QComboBox()
+        self.warehouse_combo.setMinimumWidth(300)
+        self.warehouse_combo.addItem('-- ابتدا انبار را انتخاب کنید --', None)
+        self.warehouse_combo.currentIndexChanged.connect(self._on_warehouse_changed)
+        wtop.addWidget(self.warehouse_combo, 1)
+        wtop.addStretch()
+
+        whl.addLayout(wtop)
+
+        self.warehouse_msg_lbl = QLabel('⚠️ ابتدا انبار را انتخاب کنید تا پالت‌ها و میانگین قیمت لود شوند.')
+        self.warehouse_msg_lbl.setObjectName('WarningLabel')
+        whl.addWidget(self.warehouse_msg_lbl)
+
+        root.addWidget(wh_group)
+
+        top_bar = QHBoxLayout()
+
+        top_save = QPushButton('✅ ثبت و تایید حواله')
+        top_save.setObjectName('SuccessButton')
+
+        top_new = QPushButton('حواله جدید')
+        top_new.setObjectName('SecondaryButton')
+
+        top_list = QPushButton('مشاهده لیست')
+        top_list.setObjectName('SecondaryButton')
+
+        for _b in (top_save, top_new, top_list):
+            _b.setMinimumWidth(130)
+
+        top_bar.addStretch()
+        top_bar.addWidget(top_list)
+        top_bar.addWidget(top_new)
+        top_bar.addWidget(top_save)
+
+        top_save.clicked.connect(self.save_issue)
+        top_new.clicked.connect(self.clear_form)
+        top_list.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
+
+        root.addLayout(top_bar)
+
+        self.tabs = QTabWidget()
+
+        # ------------------------------------------------------------
+        # Tab 1: اطلاعات حواله
+        # ------------------------------------------------------------
+        tab_info = QWidget()
+        tab_info_layout = QVBoxLayout(tab_info)
+        tab_info_layout.setSpacing(14)
+
+        reference_group = QGroupBox('اطلاعات مرجع و شماره حواله')
+        reference_layout = QGridLayout(reference_group)
+        reference_layout.setHorizontalSpacing(12)
+        reference_layout.setVerticalSpacing(12)
+
+        self.date_info_label = QLabel('-')
+        self.date_info_label.setObjectName('Muted')
+        self.date_info_label.setStyleSheet('color:#f59e0b;font-size:16px;font-weight:bold;')
+
+        self.operation_date_edit = QDateEdit(QDate.currentDate())
+        self.operation_date_edit.setCalendarPopup(True)
+        self.operation_date_edit.setDisplayFormat('yyyy-MM-dd')
+        self.operation_date_edit.dateChanged.connect(self._refresh_reference_numbers)
+
+        self.reference_selector_combo = QComboBox()
+        self.reference_selector_combo.currentIndexChanged.connect(self._reference_selection_changed)
+
+        self.reference_no_label = QLabel('-')
+        self.reference_no_label.setObjectName('Title')
+
+        self.document_no_label = QLabel('-')
+        self.document_no_label.setObjectName('Title')
+
+        self.stage_no_label = QLabel('-')
+        self.stage_no_label.setObjectName('Muted')
+
+        self.remaining_qty_label = QLabel('-')
+        self.remaining_qty_label.setObjectName('Muted')
+
+        reference_layout.addWidget(QLabel('تاریخ عملیات'), 0, 0)
+        reference_layout.addWidget(self.operation_date_edit, 0, 1)
+        reference_layout.addWidget(QLabel('تاریخ شمسی'), 0, 2)
+        reference_layout.addWidget(self.date_info_label, 0, 3)
+
+        reference_layout.addWidget(QLabel('مرجع خروج باز'), 1, 0)
+        reference_layout.addWidget(self.reference_selector_combo, 1, 1)
+        reference_layout.addWidget(QLabel('شماره مرجع خروج'), 1, 2)
+        reference_layout.addWidget(self.reference_no_label, 1, 3)
+
+        reference_layout.addWidget(QLabel('شماره حواله مرحله'), 2, 0)
+        reference_layout.addWidget(self.document_no_label, 2, 1)
+        reference_layout.addWidget(QLabel('مرحله'), 2, 2)
+        reference_layout.addWidget(self.stage_no_label, 2, 3)
+
+        reference_layout.addWidget(QLabel('مانده تقریبی بار'), 3, 0)
+        reference_layout.addWidget(self.remaining_qty_label, 3, 1, 1, 3)
+
+        tab_info_layout.addWidget(reference_group)
+
+        info_group = QGroupBox('اطلاعات اصلی حواله')
+        info_layout = QGridLayout(info_group)
+        info_layout.setHorizontalSpacing(12)
+        info_layout.setVerticalSpacing(12)
+
+        self.waybill_edit = QLineEdit()
+        self.customer_combo = QComboBox()
+        self.driver_combo = QComboBox()
+        self.driver_combo.currentIndexChanged.connect(self._driver_changed)
+
+        self.vehicle_label = QLabel('-')
+        self.vehicle_label.setObjectName('Muted')
+
+        self.total_declared_edit = QLineEdit()
+        self.stage_declared_edit = QLineEdit()
+        self.delivered_edit = QLineEdit()
+        self.freight_edit = QLineEdit()
+        self.source_location_edit = QLineEdit()
+        self.destination_location_edit = QLineEdit()
+        self.warehouse_keeper_edit = QLineEdit()
+        self.receiver_name_edit = QLineEdit()
+
+        self.discrepancy_label = QLabel('0')
+        self.discrepancy_label.setObjectName('Alert')
+
+        self.total_declared_edit.textChanged.connect(self._on_quantity_changed)
+        self.stage_declared_edit.textChanged.connect(self._on_quantity_changed)
+        self.delivered_edit.textChanged.connect(self._on_quantity_changed)
+        self.freight_edit.textChanged.connect(lambda: self._format_line_edit_number(self.freight_edit))
+
+        info_layout.addWidget(QLabel('شماره حواله / بارنامه'), 0, 0)
+        info_layout.addWidget(self.waybill_edit, 0, 1)
+        info_layout.addWidget(QLabel('مشتری'), 0, 2)
+        info_layout.addWidget(self.customer_combo, 0, 3)
+
+        info_layout.addWidget(QLabel('راننده'), 1, 0)
+        info_layout.addWidget(self.driver_combo, 1, 1)
+        info_layout.addWidget(QLabel('خودرو / پلاک'), 1, 2)
+        info_layout.addWidget(self.vehicle_label, 1, 3)
+
+        info_layout.addWidget(QLabel('تعداد کل بار'), 2, 0)
+        info_layout.addWidget(self.total_declared_edit, 2, 1)
+        info_layout.addWidget(QLabel('تعداد بار این مرحله'), 2, 2)
+        info_layout.addWidget(self.stage_declared_edit, 2, 3)
+
+        info_layout.addWidget(QLabel('تعداد تحویل خروج'), 3, 0)
+        info_layout.addWidget(self.delivered_edit, 3, 1)
+        info_layout.addWidget(QLabel('مغایرت'), 3, 2)
+        info_layout.addWidget(self.discrepancy_label, 3, 3)
+
+        info_layout.addWidget(QLabel('مبلغ پس‌کرایه (ریال)'), 4, 0)
+        info_layout.addWidget(self.freight_edit, 4, 1)
+        info_layout.addWidget(QLabel('مبدأ'), 4, 2)
+        info_layout.addWidget(self.source_location_edit, 4, 3)
+
+        info_layout.addWidget(QLabel('مقصد / محل ارسال'), 5, 0)
+        info_layout.addWidget(self.destination_location_edit, 5, 1)
+        info_layout.addWidget(QLabel('مسئول انبار'), 5, 2)
+        info_layout.addWidget(self.warehouse_keeper_edit, 5, 3)
+
+        info_layout.addWidget(QLabel('تحویل‌گیرنده'), 6, 0)
+        info_layout.addWidget(self.receiver_name_edit, 6, 1)
+
+        tab_info_layout.addWidget(info_group)
+
+        notes_group = QGroupBox('توضیحات و وضعیت')
+        notes_layout = QVBoxLayout(notes_group)
+
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setMinimumHeight(90)
+        self.notes_edit.setPlaceholderText('توضیحات، وضعیت خروج، عیوب کلی و ...')
+        notes_layout.addWidget(self.notes_edit)
+
+        tab_info_layout.addWidget(notes_group)
+        tab_info_layout.addStretch()
+
+        # ------------------------------------------------------------
+        # Tab 2: افزودن پالت
+        # ------------------------------------------------------------
+        tab_pallet = QWidget()
+        tab_pallet_layout = QVBoxLayout(tab_pallet)
+        tab_pallet_layout.setSpacing(14)
+
+        lines_group = QGroupBox('ردیف‌های پالت خروجی')
+        lines_layout = QVBoxLayout(lines_group)
+
+        avg_price_bar = QHBoxLayout()
+        avg_price_bar.setContentsMargins(4, 4, 4, 4)
+
+        self.avg_price_lbl = QLabel('قیمت میانگین: ')
+        self.avg_price_lbl.setObjectName('AvgPriceLabel')
+
+        self.avg_price_value = QLabel('0 ریال')
+        self.avg_price_value.setObjectName('AvgPriceValue')
+
+        avg_price_bar.addWidget(self.avg_price_lbl)
+        avg_price_bar.addWidget(self.avg_price_value)
+
+        self.sale_avg_lbl = QLabel('میانگین فروش: ')
+        self.sale_avg_value = QLabel('-')
+
+        avg_price_bar.addWidget(self.sale_avg_lbl)
+        avg_price_bar.addWidget(self.sale_avg_value)
+        avg_price_bar.addSpacing(20)
+
+        self.issue_pct_lbl = QLabel('درصد:')
+        self.issue_pct_lbl.setObjectName('IssuePctLabel')
+
+        self.issue_pct_edit = QLineEdit()
+        self.issue_pct_edit.setPlaceholderText('40')
+        self.issue_pct_edit.setText('40')
+        self.issue_pct_edit.setText('40')
+        self.issue_pct_edit.setText('40')
+        self.issue_pct_edit.setFixedWidth(80)
+        self.issue_pct_edit.setFixedHeight(32)
+        self.issue_pct_edit.setAlignment(Qt.AlignCenter)
+        self.issue_pct_edit.setObjectName('IssuePctEdit')
+        self.issue_pct_edit.textChanged.connect(self._issue_recalc_percent)
+
+        avg_price_bar.addWidget(self.issue_pct_edit)
+
+        self.issue_calc_val = QLabel('-')
+        self.issue_calc_val.setObjectName('IssueCalcValue')
+        avg_price_bar.addWidget(self.issue_calc_val)
+        self.issue_margin_lbl = QLabel('حاشیه سود روی فروش: -')
+        self.issue_margin_lbl.setObjectName('VatAmountLabel')
+        avg_price_bar.addWidget(self.issue_margin_lbl)
+        avg_price_bar.addStretch()
+
+        for _lb in (
+            self.avg_price_lbl,
+            self.avg_price_value,
+            self.sale_avg_lbl,
+            self.sale_avg_value,
+            self.issue_pct_lbl,
+            self.issue_calc_val
+        ):
+            _lb.setFixedHeight(38)
+
+        self.issue_pct_edit.setFixedHeight(34)
+        tab_pallet_layout.addLayout(avg_price_bar)
+
+        line_actions = QHBoxLayout()
+
+        self.add_line_button = QPushButton('افزودن ردیف')
+        self.add_line_button.setObjectName('SecondaryButton')
+        self.add_line_button.clicked.connect(self.add_line_row)
+
+        self.remove_line_button = QPushButton('حذف ردیف انتخابی')
+        self.remove_line_button.setObjectName('SecondaryButton')
+        self.remove_line_button.clicked.connect(self.remove_selected_line)
+
+        self.lines_total_label = QLabel('جمع ریالی ردیف‌ها: 0 ریال')
+        self.lines_total_label.setObjectName('Muted')
+
+        line_actions.addWidget(self.add_line_button)
+        line_actions.addWidget(self.remove_line_button)
+        line_actions.addStretch()
+        line_actions.addWidget(self.lines_total_label)
+
+        lines_layout.addLayout(line_actions)
+
+        self.lines_table = QTableWidget(0, 6)
+        self.lines_table.setHorizontalHeaderLabels(
+            ['ردیف', 'پالت', 'تعداد', 'قیمت هر پالت', 'مبلغ کل', 'عیوب / توضیح']
+        )
+        self.lines_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.lines_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.lines_table.verticalHeader().setVisible(False)
+
+        lines_layout.addWidget(self.lines_table, 1)
+        self._setup_lines_table_layout()
+
+        lines_group.setMaximumHeight(430)
+        tab_pallet_layout.addWidget(lines_group)
+
+        totals_group = QGroupBox('قیمت نهایی (ارزش افزوده و مخارج)')
+        totals_layout = QGridLayout(totals_group)
+        totals_layout.setHorizontalSpacing(12)
+        totals_layout.setVerticalSpacing(10)
+
+        self.vat_checkbox = QCheckBox('ارزش افزوده ۹٪')
+        self.vat_checkbox.toggled.connect(self._recalc_final_total)
+        totals_layout.addWidget(self.vat_checkbox, 0, 0)
+
+        self.vat_amount_label = QLabel('۰ ریال')
+        self.vat_amount_label.setObjectName('VatAmountLabel')
+        totals_layout.addWidget(self.vat_amount_label, 0, 1)
+
+        self.extra_checkbox = QCheckBox('مخارج اضافی')
+        self.extra_checkbox.toggled.connect(self._on_extra_toggled)
+        totals_layout.addWidget(self.extra_checkbox, 1, 0)
+
+        self.extra_costs_edit = QLineEdit()
+        self.extra_costs_edit.setPlaceholderText('۰')
+        self.extra_costs_edit.setFixedWidth(200)
+        self.extra_costs_edit.setEnabled(False)
+        self.extra_costs_edit.setAlignment(Qt.AlignCenter)
+        self.extra_costs_edit.setObjectName('ExtraCostsEdit')
+        self.extra_costs_edit.textChanged.connect(self._format_extra_costs_edit)
+        totals_layout.addWidget(self.extra_costs_edit, 1, 1)
+
+        self.final_total_label = QLabel('قیمت نهایی: ۰ ریال')
+        self.final_total_label.setObjectName('FinalTotalLabel')
+        totals_layout.addWidget(self.final_total_label, 2, 0, 1, 2)
+
+        tab_pallet_layout.addWidget(totals_group)
+
+        # ------------------------------------------------------------
+        # Tab 3: لیست حواله‌ها
+        # ------------------------------------------------------------
+        tab_list = QWidget()
+        tab_list_layout = QVBoxLayout(tab_list)
+        tab_list_layout.setSpacing(14)
+
+        right_group = QGroupBox('حواله‌های ثبت‌شده')
+        right_layout = QVBoxLayout(right_group)
+
+        right_toolbar = QHBoxLayout()
+
+        refresh_btn = QPushButton('بروزرسانی لیست')
+        refresh_btn.setObjectName('SecondaryButton')
+        refresh_btn.clicked.connect(self.refresh_issues_final)
+
+        preview_saved_btn = QPushButton('پیش‌نمایش سند انتخابی')
+        preview_saved_btn.setObjectName('SecondaryButton')
+        preview_saved_btn.clicked.connect(self.preview_selected_saved_issue)
+
+        details_btn = QPushButton('جزئیات سند')
+        details_btn.setObjectName('SecondaryButton')
+        details_btn.clicked.connect(self._show_issue_details)
+
+        rollback_btn = QPushButton('rollback سند انتخابی')
+        rollback_btn.setObjectName('SecondaryButton')
+        rollback_btn.clicked.connect(self.rollback_selected_issue)
+
+        right_toolbar.addWidget(refresh_btn)
+        right_toolbar.addWidget(preview_saved_btn)
+        right_toolbar.addWidget(details_btn)
+        right_toolbar.addWidget(rollback_btn)
+
+        archive_btn = QPushButton('بایگانی ابطال‌ها')
+        archive_btn.setObjectName('SecondaryButton')
+        archive_btn.clicked.connect(self.open_cancelled_issues_archive)
+
+        remaining_btn = QPushButton('📦 حواله‌های مانده')
+        remaining_btn.setObjectName('WarningButton')
+        remaining_btn.setMinimumWidth(150)
+        remaining_btn.clicked.connect(self._filter_remaining_shipments)
+
+        right_toolbar.addWidget(remaining_btn)
+        right_toolbar.addWidget(archive_btn)
+
+        for _tb in (refresh_btn, preview_saved_btn, details_btn, rollback_btn, archive_btn):
+            _tb.setMinimumWidth(150)
+
+        right_toolbar.addStretch()
+        right_layout.addLayout(right_toolbar)
+
+        self.issues_table = QTableWidget(0, 11)
+        self.issues_table.setStyleSheet("QTableWidget{background:#1e293b;alternate-background-color:#0f172a;color:#e2e8f0;gridline-color:#334155;}"
+                                        ""
+                                        "QTableWidget::item:selected{background:#2563eb;color:#fff;}"
+                                        "QHeaderView::section{background:#334155;color:#f1f5f9;}")  # FORCE-DARK
+        self.issues_table.setStyleSheet(self.issues_table.styleSheet() + 'QTableWidget::item{background:#1e293b;}')  # YELLOW-FIX
+        self.issues_table.setHorizontalHeaderLabels(
+            ['شناسه', 'شماره حواله', 'مرجع خروج', 'مشتری', 'راننده',
+             'تعداد کل حواله', 'خروج این حواله','مانده بار مادر', 'تاریخ', 'وضعیت', 'انبار']
+        )
+        self.issues_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.issues_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.issues_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.issues_table.verticalHeader().setVisible(False)
+        self.issues_table.setAlternatingRowColors(False)  # ALT-FIX
+        self.issues_table.setColumnHidden(0, True)
+        self.issues_table.horizontalHeader().setStretchLastSection(True)
+
+        right_layout.addWidget(self.issues_table)
+        tab_list_layout.addWidget(right_group)
+
+        self.tabs.addTab(tab_info, 'اطلاعات حواله')
+        self.tabs.addTab(tab_pallet, 'افزودن پالت')
+        self.tabs.addTab(tab_list, 'لیست حواله‌ها')
+
+        _scroll = QScrollArea()  # WIN-SCROLL
+        _scroll.setWidgetResizable(True)
+        _tabs_holder = QWidget()
+        _hl = QVBoxLayout(_tabs_holder)
+        _hl.setContentsMargins(0, 0, 0, 0)
+        self.tabs.setParent(_tabs_holder)
+        _hl.addWidget(self.tabs)
+        _scroll.setWidget(_tabs_holder)
+        root.addWidget(_scroll, 1)
+
+        self._setup_autocomplete()

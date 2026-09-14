@@ -1,0 +1,484 @@
+# -*- coding: utf-8 -*-
+"""Return Report Window - گزارش جامع برگشت از خرید و فروش
+با تب‌های: لیست اسناد | ریز اقلام سند | نمودار روند
+"""
+
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
+
+from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (
+    QAbstractItemView, QComboBox, QDateEdit, QDialog, QFileDialog,
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+)
+
+from app.core.database import DatabaseManager
+from app.repositories.return_repository import ReturnRepository
+
+
+class ReturnReportWindow(QDialog):
+    def __init__(self, db: DatabaseManager, user_data: Dict[str, Any]) -> None:
+        super().__init__()
+        self.db = db
+        self.user_data = user_data
+        self.repository = ReturnRepository(db)
+        self.current_rows: List[Dict[str, Any]] = []
+
+        self.setWindowTitle('گزارش جامع برگشت از خرید و فروش')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(1280, 780)
+        self._build_ui()
+        # ترمیم خودکار اسناد برگشتی قدیمی
+        try:
+            self.repository.backfill_return_items()
+        except Exception:
+            pass
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        # فیلترها
+        filter_group = QGroupBox('فیلتر گزارش')
+        fl = QHBoxLayout(filter_group)
+        fl.setSpacing(10)
+
+        end = QDate.currentDate()
+        start = end.addDays(-365)
+
+        fl.addWidget(QLabel('از تاریخ:'))
+        self.from_date_edit = QDateEdit(start)
+        self.from_date_edit.setCalendarPopup(True)
+        self.from_date_edit.setDisplayFormat('yyyy-MM-dd')
+        fl.addWidget(self.from_date_edit)
+        self.from_jalali_label = QLabel('')
+        self.from_jalali_label.setStyleSheet('color:#f97316; font-weight:bold;')
+        fl.addWidget(self.from_jalali_label)
+        self.from_date_edit.dateChanged.connect(self._update_jalali_labels)
+
+        fl.addWidget(QLabel('تا تاریخ:'))
+        self.to_date_edit = QDateEdit(end)
+        self.to_date_edit.setCalendarPopup(True)
+        self.to_date_edit.setDisplayFormat('yyyy-MM-dd')
+        fl.addWidget(self.to_date_edit)
+        self.to_jalali_label = QLabel('')
+        self.to_jalali_label.setStyleSheet('color:#f97316; font-weight:bold;')
+        fl.addWidget(self.to_jalali_label)
+        self.to_date_edit.dateChanged.connect(self._update_jalali_labels)
+
+        fl.addWidget(QLabel('نوع برگشت:'))
+        self.type_combo = QComboBox()
+        self.type_combo.addItem('همه', 'ALL')
+        self.type_combo.addItem('برگشت از خرید', 'PURCHASE')
+        self.type_combo.addItem('برگشت از فروش', 'SALE')
+        fl.addWidget(self.type_combo)
+
+        fl.addWidget(QLabel('طرف حساب:'))
+        self.person_combo = QComboBox()
+        self.person_combo.addItem('همه اشخاص', None)
+        self._load_persons()
+        fl.addWidget(self.person_combo)
+
+        apply_btn = QPushButton('اعمال فیلتر')
+        apply_btn.setStyleSheet(
+            "background:#2563eb;color:white;padding:6px 14px;border-radius:5px;font-weight:bold;"
+        )
+        apply_btn.clicked.connect(self.refresh)
+        fl.addWidget(apply_btn)
+
+        clear_btn = QPushButton('پاک کردن فیلتر')
+        clear_btn
+        clear_btn.clicked.connect(self._clear_filters)
+        fl.addWidget(clear_btn)
+
+        fl.addStretch()
+        root.addWidget(filter_group)
+
+        # کارت‌های آماری
+        cards = QHBoxLayout()
+        cards.setSpacing(10)
+        self.card_sale, self.card_sale_val = self._make_card('تعداد برگشت از فروش', '0', '#a855f7')
+        self.card_purchase, self.card_purchase_val = self._make_card('تعداد برگشت از خرید', '0', '#f97316')
+        self.card_amount, self.card_amount_val = self._make_card('مبلغ کل برگشتی (ریال)', '0', '#22c55e')
+        self.card_total, self.card_total_val = self._make_card('تعداد کل اسناد برگشتی', '0', '#3b82f6')
+        for c in (self.card_sale, self.card_purchase, self.card_amount, self.card_total):
+            cards.addWidget(c)
+        root.addLayout(cards)
+
+        # تب‌ها
+        self.tabs = QTabWidget()
+
+        # تب ۱: لیست اسناد
+        self.docs_tab = QWidget()
+        docs_layout = QVBoxLayout(self.docs_tab)
+        self.docs_table = QTableWidget(0, 7)
+        self.docs_table.setHorizontalHeaderLabels([
+            'ردیف', 'شماره سند برگشت', 'تاریخ', 'نوع', 'طرف حساب', 'مبلغ کل (ریال)'
+        ])
+        self.docs_table.setHorizontalHeaderItem(6, QTableWidgetItem('سند مرجع'))
+        self.docs_table.setAlternatingRowColors(True)
+        self.docs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.docs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.docs_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.docs_table.verticalHeader().setVisible(False)
+        self.docs_table.horizontalHeader().setStretchLastSection(True)
+        self.docs_table.itemSelectionChanged.connect(self._on_doc_selected)
+        docs_layout.addWidget(self.docs_table)
+
+        reason_row = QHBoxLayout()
+        reason_row.addWidget(QLabel('علت برگشت:'))
+        self.reason_label = QLabel('-')
+        self.reason_label.setStyleSheet('color:#5b6b7f; padding:6px;')
+        self.reason_label.setWordWrap(True)
+        reason_row.addWidget(self.reason_label, 1)
+        docs_layout.addLayout(reason_row)
+
+        # تب ۲: ریز اقلام سند
+        self.items_tab = QWidget()
+        items_layout = QVBoxLayout(self.items_tab)
+        self.items_hint_label = QLabel('برای مشاهده ریز اقلام، یک سند از تب «لیست اسناد» انتخاب کنید.')
+        self.items_hint_label.setStyleSheet('color:#5b6b7f; padding:6px;')
+        items_layout.addWidget(self.items_hint_label)
+
+        self.items_table = QTableWidget(0, 7)
+        self.items_table.setHorizontalHeaderLabels([
+            'ردیف', 'کد پالت', 'نام پالت', 'تعداد', 'قیمت واحد', 'مبلغ کل', 'انبار'
+        ])
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.verticalHeader().setVisible(False)
+        self.items_table.horizontalHeader().setStretchLastSection(True)
+        items_layout.addWidget(self.items_table)
+
+        # تب ۳: نمودار روند
+        self.trend_tab = QWidget()
+        trend_layout = QVBoxLayout(self.trend_tab)
+        self.trend_placeholder = QLabel('در حال بارگذاری نمودار...')
+        self.trend_placeholder.setAlignment(Qt.AlignCenter)
+        self.trend_placeholder.setStyleSheet('color:#5b6b7f; padding:40px;')
+        trend_layout.addWidget(self.trend_placeholder)
+        self.trend_canvas = None
+        self._trend_container = trend_layout
+
+        self.tabs.addTab(self.docs_tab, '📋  لیست اسناد برگشتی')
+        self.tabs.addTab(self.items_tab, '📦  ریز اقلام سند')
+        self.tabs.addTab(self.trend_tab, '📈  نمودار روند')
+        root.addWidget(self.tabs, 1)
+
+        # نوار پایین
+        bottom = QHBoxLayout()
+        self.summary_label = QLabel('تعداد اسناد برگشتی در بازه: 0  |  مبلغ کل: 0 ریال')
+        self.summary_label.setStyleSheet('color:#5b6b7f; font-size:11px;')
+        bottom.addWidget(self.summary_label, 1)
+
+        print_btn = QPushButton('🖨  چاپ گزارش')
+        print_btn.setStyleSheet(
+            "background:#059669;color:white;padding:7px 14px;border-radius:5px;"
+        )
+        print_btn.clicked.connect(self._print_report)
+        html_btn = QPushButton('📄  خروجی HTML')
+        html_btn.setStyleSheet(
+            "background:#0891b2;color:white;padding:7px 14px;border-radius:5px;"
+        )
+        html_btn.clicked.connect(self._export_html)
+
+        close_btn = QPushButton('بستن')
+        close_btn.clicked.connect(self.close)
+
+        bottom.addWidget(print_btn)
+        bottom.addWidget(html_btn)
+        bottom.addWidget(close_btn)
+        root.addLayout(bottom)
+
+        self._clear_filters()
+    def _make_card(self, title: str, value: str, color: str):
+        card = QFrame()
+        card.setStyleSheet('')
+        v = QVBoxLayout(card)
+        v.setContentsMargins(8, 6, 8, 6)
+        t = QLabel(title)
+        t.setStyleSheet('color:#ffffff; font-size:12px;')
+        t.setAlignment(Qt.AlignCenter)
+        val = QLabel(value)
+        val.setStyleSheet(f'color:{color}; font-size:18px; font-weight:bold;')
+        val.setAlignment(Qt.AlignCenter)
+        v.addWidget(t)
+        v.addWidget(val)
+        return card, val
+
+    def _load_persons(self) -> None:
+        try:
+            with self.db.connect() as conn:
+                rows = conn.execute("""
+                    SELECT DISTINCT p.id, p.first_name || ' ' || p.last_name AS name
+                    FROM persons p
+                    JOIN financial_documents fd ON fd.counterparty_person_id = p.id
+                    WHERE (fd.finance_no LIKE 'PR-%' OR fd.finance_no LIKE 'SR-%')
+                    ORDER BY name
+                """).fetchall()
+            for r in rows:
+                self.person_combo.addItem(r['name'] or '-', r['id'])
+        except Exception as exc:
+            print(f'load persons error: {exc}')
+
+    def _jalali_of(self, qdate):
+        from app.core.jalali import jalali_date_display_from_iso
+        return jalali_date_display_from_iso(qdate.toString('yyyy-MM-dd'))
+
+    def _update_jalali_labels(self, *a):
+        self.from_jalali_label.setText(self._jalali_of(self.from_date_edit.date()))
+        self.to_jalali_label.setText(self._jalali_of(self.to_date_edit.date()))
+
+    def _opening_qdate(self):
+        from PyQt5.QtCore import QDate
+        try:
+            with self.db.connect() as conn:
+                r = conn.execute("SELECT MIN(finance_date) FROM financial_documents").fetchone()
+            if r and r[0]:
+                d = QDate.fromString(str(r[0])[:10], 'yyyy-MM-dd')
+                if d.isValid():
+                    return d
+        except Exception:
+            pass
+        return None
+
+    def _clear_filters(self) -> None:
+        end = QDate.currentDate()
+        self.from_date_edit.setDate(self._opening_qdate() or end.addDays(-365))
+        self.to_date_edit.setDate(end)
+        self.type_combo.setCurrentIndex(0)
+        self.person_combo.setCurrentIndex(0)
+        self._update_jalali_labels()
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # بارگذاری داده
+    # ------------------------------------------------------------------
+    def refresh(self) -> None:
+        df = self.from_date_edit.date().toString('yyyy-MM-dd')
+        dt = self.to_date_edit.date().toString('yyyy-MM-dd')
+        if df > dt: df, dt = dt, df
+        rt = self.type_combo.currentData() or 'ALL'
+        pid = self.person_combo.currentData()
+
+        rows = self.repository.list_returns(date_from=df, date_to=dt, return_type=rt, person_id=pid)
+        self.current_rows = rows
+        s = self.repository.get_returns_summary(rows)
+
+        self.card_sale_val.setText(f"{s['sale_count']:,}")
+        self.card_purchase_val.setText(f"{s['purchase_count']:,}")
+        self.card_amount_val.setText(f"{s['total_amount']:,}")
+        self.card_total_val.setText(f"{s['total_count']:,}")
+        self.summary_label.setText(
+            f'تعداد اسناد برگشتی در بازه: {s["total_count"]}  |  مبلغ کل: {s["total_amount"]:,} ریال'
+        )
+
+        # جدول اسناد
+        self.docs_table.setRowCount(len(rows))
+        if not rows:
+            self.trend_placeholder.setText('موردی یافت نشد — آیا سند برگشت از خرید/فروشی ثبت شده است؟')
+            self.trend_placeholder.setVisible(True)
+        for i, r in enumerate(rows):
+            values = [
+                str(i + 1),
+                r['finance_no'],
+                (r['finance_date_jalali'] or '') + ' | ' + (r['finance_date'] or ''),
+                r['type_label'],
+                r['person_name'],
+                f"{r['total_amount']:,}",
+            ]
+            for c, v in enumerate(values):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                # ذخیره ID سند در ستون شماره
+                if c == 1:
+                    item.setData(Qt.UserRole, r['id'])
+                # رنگ نوع
+                if c == 3:
+                    if r['type_code'] == 'PURCHASE':
+                        item.setForeground(QColor('#f97316'))
+                    else:
+                        item.setForeground(QColor('#a855f7'))
+                self.docs_table.setItem(i, c, item)
+            _src = QTableWidgetItem(str(r.get('source_doc_no') or '-'))
+            _src.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.docs_table.setItem(i, 6, _src)
+        self.docs_table.resizeColumnsToContents()
+
+        if rows:
+            self.docs_table.selectRow(0)
+        else:
+            self._clear_items()
+            self.reason_label.setText('-')
+
+        # نمودار
+        self._draw_trend_chart()
+
+    def _on_doc_selected(self) -> None:
+        row = self.docs_table.currentRow()
+        if row < 0:
+            self._clear_items()
+            return
+        item = self.docs_table.item(row, 1)
+        if not item:
+            return
+        doc_id = item.data(Qt.UserRole)
+        if not doc_id:
+            return
+        # علت
+        matching = next((r for r in self.current_rows if r['id'] == doc_id), None)
+        self.reason_label.setText((matching or {}).get('reason', '-') or '-')
+        # اقلام
+        items = self.repository.get_return_items(int(doc_id))
+        self._fill_items_table(items, item.text())
+
+    def _fill_items_table(self, items: List[Dict[str, Any]], smart_no: str) -> None:
+        if not items:
+            self.items_hint_label.setText(f'سند {smart_no} فاقد ریز اقلام است.')
+            self.items_table.setRowCount(0)
+            return
+        self.items_hint_label.setText(
+            f'📦 ریز اقلام سند برگشتی: {smart_no}   |   تعداد ردیف‌ها: {len(items)}'
+        )
+        self.items_table.setRowCount(len(items))
+        for i, it in enumerate(items):
+            values = [
+                str(it.get('row_no') or (i + 1)),
+                it.get('pallet_code') or '-',
+                it.get('pallet_name') or '-',
+                f"{int(it.get('qty') or 0):,}",
+                f"{int(it.get('unit_price') or 0):,}",
+                f"{int(it.get('total_price') or 0):,}",
+                it.get('warehouse_name') or '-',
+            ]
+            for c, v in enumerate(values):
+                cell = QTableWidgetItem(str(v))
+                cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.items_table.setItem(i, c, cell)
+        self.items_table.resizeColumnsToContents()
+
+    def _clear_items(self) -> None:
+        self.items_table.setRowCount(0)
+        self.items_hint_label.setText(
+            'برای مشاهده ریز اقلام، یک سند از تب «لیست اسناد» انتخاب کنید.'
+        )
+
+    # ------------------------------------------------------------------
+    # نمودار روند
+    # ------------------------------------------------------------------
+    def _draw_trend_chart(self) -> None:
+        try:
+            import matplotlib
+            matplotlib.use('Qt5Agg')
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        except Exception as exc:
+            self.trend_placeholder.setText(
+                f'برای نمایش نمودار، matplotlib لازم است.\nخطا: {exc}'
+            )
+            return
+
+        # پاک‌سازی canvas قبلی
+        if self.trend_canvas is not None:
+            self._trend_container.removeWidget(self.trend_canvas)
+            self.trend_canvas.deleteLater()
+            self.trend_canvas = None
+
+        trend = self.repository.get_returns_daily_trend(self.current_rows)
+        if not trend:
+            self.trend_placeholder.setVisible(True)
+            self.trend_placeholder.setText('داده‌ای برای نمایش نمودار وجود ندارد.')
+            return
+        self.trend_placeholder.setVisible(False)
+
+        dates = [t['date_jalali'] for t in trend]
+        purchase = [t['purchase'] for t in trend]
+        sale = [t['sale'] for t in trend]
+        totals = [t['total'] for t in trend]
+
+        fig = Figure(figsize=(9, 4.5), facecolor='#39424f')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#39424f')
+
+        x = list(range(len(dates)))
+        width = 0.35
+        ax.bar([i - width/2 for i in x], purchase, width, label='برگشت خرید', color='#f97316')
+        ax.bar([i + width/2 for i in x], sale, width, label='برگشت فروش', color='#a855f7')
+        ax.plot(x, totals, color='#22c55e', marker='o', linewidth=2, label='جمع کل')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(dates, rotation=45, ha='right', color='#e8eef7', fontsize=8)
+        ax.tick_params(colors='#e8eef7')
+        ax.set_ylabel('مبلغ (ریال)', color='#e8eef7')
+        ax.set_title('روند برگشت‌ها', color='#e8eef7', fontsize=12, pad=10)
+        ax.grid(True, alpha=0.2, color='#6b7686')
+        ax.legend(loc='upper left', facecolor='#46505f', edgecolor='#5b6675', labelcolor='#e8eef7')
+        for spine in ax.spines.values():
+            spine.set_color('#5b6675')
+
+        fig.tight_layout()
+        self.trend_canvas = FigureCanvasQTAgg(fig)
+        self._trend_container.addWidget(self.trend_canvas)
+
+    # ------------------------------------------------------------------
+    # خروجی
+    # ------------------------------------------------------------------
+    def _build_html(self) -> str:
+        rows_html = ''.join(
+            f"<tr><td>{i+1}</td><td>{r['finance_no']}</td><td>{r['finance_date_jalali']}</td>"
+            f"<td>{r['type_label']}</td><td>{r['person_name']}</td>"
+            f"<td>{r['total_amount']:,}</td></tr>"
+            for i, r in enumerate(self.current_rows)
+        )
+        total_amount = sum(int(r['total_amount'] or 0) for r in self.current_rows)
+        return f"""
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<title>گزارش برگشت</title>
+<style>
+body{{font-family:Tahoma;padding:20px}}
+h2{{text-align:center;color:#1e40af}}
+table{{width:100%;border-collapse:collapse;margin-top:10px}}
+th{{background:#1e40af;color:white;padding:8px}}
+td{{padding:6px;border:1px solid #cbd5e1;text-align:right}}
+tr:nth-child(even){{background:#f8fafc}}
+tfoot td{{background:#dbeafe;font-weight:bold}}
+</style></head><body>
+<h2>گزارش جامع برگشت از خرید و فروش</h2>
+<table>
+<thead><tr><th>ردیف</th><th>شماره سند</th><th>تاریخ</th><th>نوع</th><th>طرف حساب</th><th>مبلغ (ریال)</th></tr></thead>
+<tbody>{rows_html}</tbody>
+<tfoot><tr><td colspan="5">جمع کل</td><td>{total_amount:,}</td></tr></tfoot>
+</table></body></html>"""
+
+    def _print_report(self) -> None:
+        try:
+            from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
+            from PyQt5.QtGui import QTextDocument
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', f'ماژول چاپ در دسترس نیست:\n{exc}')
+            return
+        doc = QTextDocument()
+        doc.setHtml(self._build_html())
+        printer = QPrinter(QPrinter.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec_() == QPrintDialog.Accepted:
+            doc.print_(printer)
+
+    def _export_html(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'ذخیره HTML گزارش برگشت', 'returns-report.html', 'HTML Files (*.html)'
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(self._build_html())
+            QMessageBox.information(self, 'موفق', f'گزارش با موفقیت ذخیره شد:\n{file_path}')
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطا', f'ذخیره ناموفق:\n{exc}')
