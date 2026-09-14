@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
+    QCompleter,
     QAbstractItemView,
     QCheckBox,
     QComboBox,
@@ -129,8 +130,13 @@ class PersonListDialog(QDialog):
         self.active_filter_combo.addItem('فقط غیرفعال', 'INACTIVE')
         self.active_filter_combo.currentIndexChanged.connect(self.refresh_table)
 
+        
         refresh_button = _colored_button('🔄 بروزرسانی')
         refresh_button.clicked.connect(self.refresh_table)
+
+        # ✅ دکمه خروجی اکسل
+        export_button = _colored_button('📊 خروجی اکسل', 'success')
+        export_button.clicked.connect(self._export_to_excel)
 
         toolbar.addWidget(self.search_edit, 1)
         toolbar.addWidget(QLabel('نقش:'))
@@ -143,10 +149,10 @@ class PersonListDialog(QDialog):
         # جدول
         table_group = QGroupBox('👥  لیست اشخاص')
         table_layout = QVBoxLayout(table_group)
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
             'شناسه', 'نام و نام خانوادگی', 'نقش‌ها', 'کد ملی',
-            'موبایل', 'ایمیل', 'استان / شهر', 'وضعیت',
+            'موبایل', 'ایمیل', 'استان / شهر', 'آدرس', 'توضیحات', 'وضعیت',
         ])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -200,6 +206,8 @@ class PersonListDialog(QDialog):
                 row.get('mobile') or '-',
                 row.get('email') or '-',
                 location_text,
+                row.get('address') or '-',
+                row.get('notes') or '-',
                 status_text,
             ]
             for column_index, value in enumerate(values):
@@ -207,6 +215,53 @@ class PersonListDialog(QDialog):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(row_index, column_index, item)
         self.table.resizeColumnsToContents()
+
+    
+    # ✅ متد جدید: خروجی اکسل با تمام ستون‌ها
+    def _export_to_excel(self) -> None:
+        """خروجی اکسل با تمام ستون‌ها شامل آدرس و توضیحات"""
+        from datetime import datetime
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'خروجی اکسل', 
+            f'اشخاص_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xml',
+            'Excel XML (*.xml)'
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.xml'):
+            path += '.xml'
+        
+        def esc(v):
+            return str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        # ✅ هدر شامل تمام ۱۰ ستون
+        hdr = ['شناسه', 'نام و نام خانوادگی', 'نقش‌ها', 'کد ملی', 'موبایل', 
+               'ایمیل', 'استان / شهر', 'آدرس', 'توضیحات', 'وضعیت']
+        
+        xml = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<?mso-application progid="Excel.Sheet"?>',
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">',
+            '<Worksheet ss:Name="اشخاص"><Table>'
+        ]
+        xml.append('<Row>' + ''.join(f'<Cell><Data ss:Type="String">{esc(h)}</Data></Cell>' for h in hdr) + '</Row>')
+        
+        # ✅ اضافه کردن تمام ردیف‌ها با تمام ستون‌ها
+        for i in range(self.table.rowCount()):
+            row_data = []
+            for c in range(len(hdr)):
+                item = self.table.item(i, c)
+                row_data.append(item.text() if item else "")
+            xml.append('<Row>' + ''.join(f'<Cell><Data ss:Type="String">{esc(v)}</Data></Cell>' for v in row_data) + '</Row>')
+        
+        xml.append('</Table></Worksheet></Workbook>')
+        
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(''.join(xml))
+            QMessageBox.information(self, 'موفق', f'فایل با موفقیت ذخیره شد:\n{path}')
+        except Exception as e:
+            QMessageBox.critical(self, 'خطا', f'خطا در ذخیره:\n{e}')
 
     def select_row_by_id(self, person_id: int) -> None:
         for row_index in range(self.table.rowCount()):
@@ -347,8 +402,12 @@ class PersonManagerWindow(QDialog):
         self.email_edit = QLineEdit()
 
         self.province_combo = QComboBox()
+        self.province_combo.setEditable(True)
+        self.province_combo.setInsertPolicy(QComboBox.NoInsert)
         self.province_combo.currentIndexChanged.connect(self._province_changed)
         self.city_combo = QComboBox()
+        self.city_combo.setEditable(True)
+        self.city_combo.setInsertPolicy(QComboBox.NoInsert)
 
         self.is_active_checkbox = QCheckBox('شخص فعال است')
         self.is_active_checkbox.setChecked(True)

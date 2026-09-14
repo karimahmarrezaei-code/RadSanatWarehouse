@@ -1,0 +1,56 @@
+--- a/app/ui/expense_window.py
++++ b/app/ui/expense_window.py
+@@ -19,6 +19,7 @@
+ from datetime import datetime
+ from typing import Optional
+ from PyQt5.QtCore import Qt, QDate
++from PyQt5.QtWidgets import QLabel
+ from PyQt5.QtWidgets import (
+     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+     QPushButton, QGroupBox, QMessageBox, QFrame, QDateEdit,
+@@ -26,6 +27,7 @@
+ )
+ from app.core.jalali import jalali_date_display_from_iso
+ 
++
+ class ExpenseWindow(QDialog):
+     """فرم ثبت هزینه جدید با انتخاب حساب پرداخت"""
+     def __init__(self, db, user_data, expense_id: Optional[int] = None, parent=None) -> None:
+@@ -107,9 +109,16 @@ class ExpenseWindow(QDialog):
+     # تاریخ
+     self.date_edit = QDateEdit(QDate.currentDate())
+     self.date_edit.setCalendarPopup(True)
+     self.date_edit.setDisplayFormat('yyyy-MM-dd')
++    self.date_edit.dateChanged.connect(self._update_jalali_date_label)
+     form_layout.addRow("تاریخ هزینه:", self.date_edit)
++    
++    # لیبل تاریخ شمسی
++    self.jalali_date_lbl = QLabel(jalali_date_display_from_iso(QDate.currentDate().toString('yyyy-MM-dd')))
++    self.jalali_date_lbl.setStyleSheet(
++        "color: #0284c7; font-weight: bold; font-size: 14px; "
++        "padding: 5px; background: #f0f9ff; border-radius: 5px;"
++    )
++    form_layout.addRow("تاریخ شمسی:", self.jalali_date_lbl)
+ 
+     # دسته‌بندی
+     self.category_combo = QComboBox()
+@@ -250,6 +259,11 @@ class ExpenseWindow(QDialog):
+         else:
+             self.balance_lbl.setStyleSheet("font-weight: bold; color: #ea580c; font-size: 14px;")
+ 
++    def _update_jalali_date_label(self):
++        """بروزرسانی لیبل تاریخ شمسی هنگام تغییر تاریخ"""
++        iso_date = self.date_edit.date().toString('yyyy-MM-dd')
++        self.jalali_date_lbl.setText(jalali_date_display_from_iso(iso_date))
++
+     # ------------------------------------------------------------------
+     # [C5] هستهٔ اصلی رفع: برگردانی تراکنش‌های قبلی هنگام ویرایش
+     # ------------------------------------------------------------------
+@@ -283,6 +297,8 @@ class ExpenseWindow(QDialog):
+         try:
+             date = QDate.fromString(row['expense_date'], 'yyyy-MM-dd')
+             self.date_edit.setDate(date)
++            # بروزرسانی لیبل تاریخ شمسی
++            self._update_jalali_date_label()
+         except Exception:
+             pass

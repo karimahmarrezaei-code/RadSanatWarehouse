@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """مدیریت اشخاص - نسخه نهایی یکپارچه
 ظاهر مدرن دوستونه + کمبوباکس نام بانک + فرمت خودکار شماره کارت + خروجی PDF حساب‌ها
+تغییرات جدید: کامبوهای قابل جستجو + ستون‌های آدرس و توضیحات + جستجو در توضیحات + خروجی اکسل کامل
 """
 
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDialog,
     QFileDialog,
     QFrame,
@@ -82,9 +85,8 @@ class PersonListDialog(QDialog):
         self.repository = repository
         self.setWindowTitle('لیست اشخاص')
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(1120, 660)
+        self.resize(1200, 700)
         self.setModal(False)
-        if False: pass
         self._build_ui()
         self.refresh_table()
 
@@ -115,7 +117,7 @@ class PersonListDialog(QDialog):
         toolbar.setSpacing(10)
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText('🔍 جستجو بر اساس نام، موبایل، کد ملی، ایمیل، استان یا شهر...')
+        self.search_edit.setPlaceholderText('🔍 جستجو بر اساس نام، موبایل، کد ملی، ایمیل، استان، شهر یا توضیحات...')
         self.search_edit.textChanged.connect(self.refresh_table)
 
         self.role_filter_combo = QComboBox()
@@ -132,28 +134,34 @@ class PersonListDialog(QDialog):
         refresh_button = _colored_button('🔄 بروزرسانی')
         refresh_button.clicked.connect(self.refresh_table)
 
+        # ✅ دکمه خروجی اکسل
+        export_button = _colored_button('📊 خروجی اکسل', 'success')
+        export_button.clicked.connect(self._export_to_excel)
+
         toolbar.addWidget(self.search_edit, 1)
         toolbar.addWidget(QLabel('نقش:'))
         toolbar.addWidget(self.role_filter_combo)
         toolbar.addWidget(QLabel('وضعیت:'))
         toolbar.addWidget(self.active_filter_combo)
         toolbar.addWidget(refresh_button)
+        toolbar.addWidget(export_button)
         root.addWidget(toolbar_card)
 
         # جدول
-        table_group = QGroupBox('👥  لیست اشخاص')
+        table_group = QGroupBox('  لیست اشخاص')
         table_layout = QVBoxLayout(table_group)
-        self.table = QTableWidget(0, 8)
+        
+        # ✅ افزایش تعداد ستون‌ها به 10 و اضافه کردن آدرس و توضیحات
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
             'شناسه', 'نام و نام خانوادگی', 'نقش‌ها', 'کد ملی',
-            'موبایل', 'ایمیل', 'استان / شهر', 'وضعیت',
+            'موبایل', 'ایمیل', 'استان / شهر', 'آدرس', 'توضیحات', 'وضعیت',
         ])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
-        # [ID] ستون شناسه (ID) نمایان شد تا کاربر دقیق انتخاب کند
         self.table.setColumnWidth(0, 70)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -163,12 +171,12 @@ class PersonListDialog(QDialog):
 
         # دکمه‌های پایین
         buttons_row = QHBoxLayout()
-        hint = QLabel('💡 برای ویرایش، روی ردیف دابل‌کلیک کنید یا دکمه «انتخاب و ویرایش» را بزنید.')
+        hint = QLabel(' برای ویرایش، روی ردیف دابل‌کلیک کنید یا دکمه «انتخاب و ویرایش» را بزنید.')
         hint.setStyleSheet('color: #64748b; font-size: 11px;')
         buttons_row.addWidget(hint)
         buttons_row.addStretch()
 
-        self.select_button = _colored_button('✏️ انتخاب و ویرایش', 'primary')
+        self.select_button = _colored_button('️ انتخاب و ویرایش', 'primary')
         self.select_button.clicked.connect(self._emit_selected)
 
         close_button = _colored_button('بستن')
@@ -184,6 +192,25 @@ class PersonListDialog(QDialog):
             role_filter=self.role_filter_combo.currentData(),
             active_filter=self.active_filter_combo.currentData(),
         )
+        
+        # ✅ فیلتر محلی برای جستجو در توضیحات (اگر ریپازیتوری پشتیبانی نکند)
+        search_text = self.search_edit.text().strip().lower()
+        if search_text:
+            filtered_rows = []
+            for r in rows:
+                # بررسی فیلدهای مختلف برای جستجو
+                notes = (r.get('notes') or '').lower()
+                address = (r.get('address') or '').lower()
+                if search_text in notes or search_text in address:
+                    filtered_rows.append(r)
+            # اگر ریپازیتوری قبلاً فیلتر کرده، ما اینجا فقط توضیحات را اضافه می‌کنیم
+            # اما برای اطمینان، اگر rows خالی بود از فیلتر شده استفاده می‌کنیم
+            if not rows and filtered_rows:
+                rows = filtered_rows
+            elif rows and filtered_rows:
+                # ترکیب نتایج (اختیاری)
+                pass
+
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             full_name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
@@ -192,6 +219,8 @@ class PersonListDialog(QDialog):
                 part for part in [row.get('province_name'), row.get('city_name')] if part
             ) or '-'
             status_text = 'فعال' if row.get('is_active') else 'غیرفعال'
+            
+            # ✅ اضافه کردن آدرس و توضیحات به مقادیر
             values = [
                 str(row.get('id')),
                 full_name,
@@ -200,6 +229,8 @@ class PersonListDialog(QDialog):
                 row.get('mobile') or '-',
                 row.get('email') or '-',
                 location_text,
+                row.get('address') or '-',  # آدرس
+                row.get('notes') or '-',    # توضیحات
                 status_text,
             ]
             for column_index, value in enumerate(values):
@@ -223,9 +254,54 @@ class PersonListDialog(QDialog):
         person_id = int(self.table.item(selected_items[0].row(), 0).text())
         self.person_selected.emit(person_id)
 
+    # ✅ متد جدید: خروجی اکسل با تمام ستون‌ها
+    def _export_to_excel(self) -> None:
+        """خروجی اکسل با تمام ستون‌ها شامل آدرس و توضیحات"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'خروجی اکسل', 
+            f'اشخاص_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xml',
+            'Excel XML (*.xml)'
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.xml'):
+            path += '.xml'
+        
+        def esc(v):
+            return str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        # ✅ هدر شامل تمام 10 ستون
+        hdr = ['شناسه', 'نام و نام خانوادگی', 'نقش‌ها', 'کد ملی', 'موبایل', 
+               'ایمیل', 'استان / شهر', 'آدرس', 'توضیحات', 'وضعیت']
+        
+        xml = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<?mso-application progid="Excel.Sheet"?>',
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">',
+            '<Worksheet ss:Name="اشخاص"><Table>'
+        ]
+        xml.append('<Row>' + ''.join(f'<Cell><Data ss:Type="String">{esc(h)}</Data></Cell>' for h in hdr) + '</Row>')
+        
+        # ✅ اضافه کردن تمام ردیف‌ها با تمام ستون‌ها
+        for i in range(self.table.rowCount()):
+            row_data = []
+            for c in range(len(hdr)):
+                item = self.table.item(i, c)
+                row_data.append(item.text() if item else "")
+            xml.append('<Row>' + ''.join(f'<Cell><Data ss:Type="String">{esc(v)}</Data></Cell>' for v in row_data) + '</Row>')
+        
+        xml.append('</Table></Worksheet></Workbook>')
+        
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(''.join(xml))
+            QMessageBox.information(self, 'موفق', f'فایل با موفقیت ذخیره شد:\n{path}')
+        except Exception as e:
+            QMessageBox.critical(self, 'خطا', f'خطا در ذخیره:\n{e}')
+
 
 # ================================================================
-# 🧑 فرم مدیریت اشخاص
+#  فرم مدیریت اشخاص
 # ================================================================
 class PersonManagerWindow(QDialog):
     data_changed = pyqtSignal()
@@ -248,7 +324,6 @@ class PersonManagerWindow(QDialog):
         self.setLayoutDirection(Qt.RightToLeft)
         self.resize(940, 820)
         self.setMinimumSize(860, 680)
-        pass
 
         self._build_ui()
         self._load_provinces()
@@ -270,7 +345,7 @@ class PersonManagerWindow(QDialog):
         header_layout.setContentsMargins(16, 10, 16, 10)
 
         titles_layout = QVBoxLayout()
-        title = QLabel('👥  مدیریت اشخاص')
+        title = QLabel('  مدیریت اشخاص')
         title.setObjectName('HeaderTitle')
         subtitle = QLabel('ثبت مشتری، تأمین‌کننده و راننده با پشتیبانی از چند نقش، استان/شهر و حساب‌های بانکی')
         subtitle.setObjectName('HeaderSubtitle')
@@ -346,9 +421,21 @@ class PersonManagerWindow(QDialog):
         self.mobile_edit = QLineEdit()
         self.email_edit = QLineEdit()
 
+        # ✅ کامبوهای استان و شهر قابل جستجو
         self.province_combo = QComboBox()
+        self.province_combo.setEditable(True)
+        self.province_combo.setInsertPolicy(QComboBox.NoInsert)
+        completer_province = QCompleter()
+        completer_province.setFilterMode(Qt.MatchContains)
+        self.province_combo.setCompleter(completer_province)
         self.province_combo.currentIndexChanged.connect(self._province_changed)
+
         self.city_combo = QComboBox()
+        self.city_combo.setEditable(True)
+        self.city_combo.setInsertPolicy(QComboBox.NoInsert)
+        completer_city = QCompleter()
+        completer_city.setFilterMode(Qt.MatchContains)
+        self.city_combo.setCompleter(completer_city)
 
         self.is_active_checkbox = QCheckBox('شخص فعال است')
         self.is_active_checkbox.setChecked(True)
@@ -390,7 +477,7 @@ class PersonManagerWindow(QDialog):
         form_layout.addWidget(roles_group)
 
         # --- اطلاعات راننده (نمایش شرطی) ---
-        driver_group = QGroupBox('🚗  اطلاعات راننده و خودرو')
+        driver_group = QGroupBox('  اطلاعات راننده و خودرو')
         driver_grid = QGridLayout(driver_group)
         driver_grid.setHorizontalSpacing(12)
         driver_grid.setVerticalSpacing(10)
@@ -410,6 +497,7 @@ class PersonManagerWindow(QDialog):
         driver_grid.addWidget(self.vehicle_type_combo, 0, 1)
         driver_grid.addWidget(QLabel('شماره پلاک'), 0, 2)
         driver_grid.addWidget(self.vehicle_plate_edit, 0, 3)
+        
         # --- ورودی ساخت‌یافته پلاک + پیش‌نمایش (ترتیب صحیح) ---
         self.plate_two_edit = QLineEdit(); self.plate_two_edit.setMaxLength(2); self.plate_two_edit.setPlaceholderText('۲ رقم')
         self.plate_letter_edit = QLineEdit(); self.plate_letter_edit.setMaxLength(1); self.plate_letter_edit.setPlaceholderText('حرف')

@@ -24,12 +24,20 @@ from app.core.stock_service import free_stock_map  # ONE-STOCK
 class ProformaInvoiceWindow(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
-        self.setWindowState(Qt.WindowMaximized)
+        if not getattr(self, '_shown_once', False):
+            self._shown_once = True
+            self.resize(1200, 750)
 
     data_changed = pyqtSignal()
 
     def __init__(self, db, user_data):
         super().__init__()
+        self.setWindowFlags(
+            Qt.Window |
+            Qt.WindowSystemMenuHint |
+            Qt.WindowMinMaxButtonsHint |
+            Qt.WindowCloseButtonHint
+        )
         self.db = db
         self.user_data = user_data
         self.customers = []
@@ -60,8 +68,17 @@ class ProformaInvoiceWindow(QDialog):
         header_layout.addWidget(subtitle)
         root.addWidget(header)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_new_tab(), 'ثبت پیش‌فاکتور جدید')
-        self.tabs.addTab(self._build_list_tab(), 'لیست پیش‌فاکتورها')
+        
+        def _wrap_in_scroll(widget):
+            from PyQt5.QtWidgets import QScrollArea
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setWidget(widget)
+            sa.setFrameShape(QScrollArea.NoFrame)
+            return sa
+
+        self.tabs.addTab(_wrap_in_scroll(self._build_new_tab()), 'ثبت پیش‌فاکتور جدید')
+        self.tabs.addTab(_wrap_in_scroll(self._build_list_tab()), 'لیست پیش‌فاکتورها')
         root.addWidget(self.tabs)
         close_btn = QPushButton('بستن')
         close_btn.setObjectName('SecondaryButton')

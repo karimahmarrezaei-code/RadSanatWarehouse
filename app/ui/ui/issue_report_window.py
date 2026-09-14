@@ -178,9 +178,13 @@ class IssueReportWindow(QDialog):
         root.addWidget(self.tabs)
 
         # تنظیم تاریخ پیش‌فرض
-        first_day_of_month = date.fromisoformat(today_iso_date()).replace(day=1)
-        self.from_edit.setDate(QDate.fromString(first_day_of_month.isoformat(), 'yyyy-MM-dd'))
-        self.to_edit.setDate(QDate.fromString(today_iso_date(), 'yyyy-MM-dd'))
+        # تنظیم تاریخ پیش‌فرض ( ماه گذشته تا امروز)
+        # تنظیم تاریخ پیش‌فرض (۶ ماه گذشته تا امروز - میلادی)
+        from datetime import date, timedelta
+        today = date.today()
+        six_months_ago = today - timedelta(days=180)
+        self.from_edit.setDate(QDate(six_months_ago.year, six_months_ago.month, six_months_ago.day))
+        self.to_edit.setDate(QDate(today.year, today.month, today.day))
 
         self._update_from_jalali()
         self._update_to_jalali()
@@ -308,86 +312,86 @@ class IssueReportWindow(QDialog):
                 self.tbl.setItem(i, cc, it)
         if self.tbl.rowCount():
             self._on_select(0, 0, -1, -1)
-
     def refresh(self):
+        # خواندن تاریخ از QDateEdit
         f = self.from_edit.date().toString('yyyy-MM-dd')
         t = self.to_edit.date().toString('yyyy-MM-dd')
         c = self.person_combo.currentData()
-
-        q = ("SELECT wi.id, wi.issue_no, wi.stage_no, wi.issue_date, wi.waybill_no, wi.issue_status, "
-             "       wi.stage_load_qty, wi.delivered_qty, "
-             "       ol.reference_no AS ref, ol.total_load_qty AS tlq, ol.id AS load_id, "
-             "       COALESCE(d.first_name||' '||d.last_name, '-') AS drv, "
-             "       COALESCE(p.first_name||' '||p.last_name, '-') AS cust, "
-             "       COALESCE(SUM(ii.qty),0) AS q, COALESCE(SUM(ii.qty*ii.unit_price),0) AS amt "
-             "FROM warehouse_issues wi "
-             "LEFT JOIN outbound_loads ol ON ol.id=wi.outbound_load_id "
-             "LEFT JOIN persons p ON p.id=wi.customer_id "
-             "LEFT JOIN persons d ON d.id=wi.driver_id "
-             "LEFT JOIN warehouse_issue_items ii ON ii.issue_id=wi.id "
-             "WHERE 1=1")
-
+        
+        print(f"[DEBUG] Filter: from={f}, to={t}, customer={c}")
+        
+        q = ("SELECT wi.id, wi.issue_no, wi.issue_date, wi.stage_no, wi.outbound_load_id, "
+            "wi.issue_status, wi.waybill_no, "
+            "ol.reference_no AS ref, ol.total_load_qty AS tlq, "
+            "d.first_name||' '||d.last_name AS drv, "
+            "COALESCE(p.first_name||' '||p.last_name,'-') AS cust, "
+            "(SELECT COALESCE(SUM(ii.qty),0) FROM warehouse_issue_items ii WHERE ii.issue_id=wi.id) AS q, "
+            "(SELECT COALESCE(SUM(ii.qty*ii.unit_price),0) FROM warehouse_issue_items ii WHERE ii.issue_id=wi.id) AS amt "
+            "FROM warehouse_issues wi "
+            "LEFT JOIN outbound_loads ol ON ol.id=wi.outbound_load_id "
+            "LEFT JOIN persons p ON p.id=wi.customer_id "
+            "LEFT JOIN persons d ON d.id=wi.driver_id")
+        
         conds, params = [], []
-        if f:
-            conds.append("wi.issue_date >= ?"); params.append(f)
-        if t:
-            conds.append("wi.issue_date <= ?"); params.append(t)
-        if c is not None:
-            conds.append("wi.customer_id = ?"); params.append(c)
-        if conds:
-            q += " AND " + " AND ".join(conds)
-        q += " GROUP BY wi.id ORDER BY wi.issue_date DESC, wi.id DESC"
-
+        if f: conds.append("wi.issue_date >= ?"); params.append(f)
+        if t: conds.append("wi.issue_date <= ?"); params.append(t)
+        if c is not None: conds.append("wi.customer_id = ?"); params.append(c)
+        
+        if conds: q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY wi.issue_date DESC, wi.id DESC"
+        
+        print(f"[DEBUG] Query: {q}")
+        print(f"[DEBUG] Params: {params}")
+        
         with self.db.connect() as conn:
-            conn.row_factory = None
             try:
                 rows = conn.execute(q, params).fetchall()
+                print(f"[DEBUG] Rows fetched: {len(rows)}")
+                
+                # نمایش محتوای اولین رکورد
+                if rows:
+                    print(f"[DEBUG] First row keys: {rows[0].keys()}")
+                    print(f"[DEBUG] First row data: {dict(rows[0])}")
+                    
             except Exception as e:
-                QMessageBox.critical(self, 'خطا', str(e))
+                print(f"[ERROR] {e}")
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(self, 'خطا', f'خطا در بارگذاری داده‌ها:\n{str(e)}')
                 rows = []
-
+        
         self.tbl.setRowCount(len(rows))
-        self._ids, self._refs, self._loads, self._custs = [], [], [], []
-
+        self._ids = []
+        self._refs = []
+        self._loads = []
+        self._custs = []
+        
         for i, r in enumerate(rows):
-            self._ids.append(r[0])
-            self._refs.append(r[8] or '')
-            self._loads.append(r[10])
-            self._custs.append(r[12] or '-')
-
-            status = r[5] or ''
+            self._ids.append(r['id'])
+            self._refs.append(r['ref'] or '')
+            self._loads.append(r['outbound_load_id'])
+            self._custs.append(r['cust'] or '-')
+            
             vals = [
-                r[1] or '', r[8] or '', str(r[2] or 1),
-                jalali_date_display_from_iso(r[3]) if r[3] else '-',
-                r[12] or '-', r[11] or '-', r[4] or '-',
-                f"{int(r[13] or 0):,}", f"{int(r[6] or 0):,}", f"{int(r[14] or 0):,}",
-                STATUS_FA.get(status, status)
+                r['issue_no'] or '', r['ref'] or '', str(r['stage_no'] or 1), 
+                jalali_date_display_from_iso(r['issue_date']), r['cust'], 
+                r['drv'] or '-', r['waybill_no'] or '', 
+                f"{int(r['q'] or 0):,}", f"{int(r['tlq'] or 0):,}", 
+                f"{int(r['amt'] or 0):,}", STATUS_FA.get(r['issue_status'], r['issue_status'] or '')
             ]
-
-            # ✅ رنگ‌بندی بر اساس وضعیت
-            if status == 'CANCELLED':
-                bg = QBrush(QColor(254, 226, 226))   # قرمز کم‌رنگ
-                fg = QBrush(QColor(153, 27, 27))      # متن قرمز تیره
-            elif status == 'PARTIAL':
-                bg = QBrush(QColor(254, 240, 199))   # زرد کم‌رنگ
-                fg = None
-            elif status == 'COMPLETED':
-                bg = QBrush(QColor(220, 252, 231))   # سبز کم‌رنگ
-                fg = None
-            else:
-                bg, fg = None, None
-
+            
+            print(f"[DEBUG] Row {i}: {vals}")
+            
             for cc, v in enumerate(vals):
                 it = QTableWidgetItem(str(v))
                 it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if bg:
-                    it.setBackground(bg)
-                if fg:
-                    it.setForeground(fg)
                 self.tbl.setItem(i, cc, it)
-
+        
         if self.tbl.rowCount():
-            self._on_select(0, 0, -1, -1)
+            self._on_select(0, 0, -1, -1)        
+            
+
+
     def _fill_table(self, rows, use_dict=False):
         if use_dict:
             rows = [r if isinstance(r, dict) else dict(r) for r in rows]

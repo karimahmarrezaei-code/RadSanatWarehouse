@@ -2,19 +2,17 @@
 """
 فرم ثبت هزینه‌های عملیاتی با انتخاب حساب پرداخت
 ثبت هزینه با انتخاب صندوق یا بانک + ثبت خودکار تراکنش نقدی
-
-⚠️ نسخه اصلاح‌شده (بازبینی ۱۴۰۵/۰۵/۱۱):
-  [C5]  رفع باگ بحرانی «ویرایش هزینه»:
-        - تراکنش‌های نقدی قبلی این هزینه برگردانده می‌شوند (موجودی حساب قبلی بازگردانده می‌شود)
-        - تراکنش جدید با مبلغ و حساب جدید ثبت می‌شود
-  [C5b] رفع باگ «ویرایش ذخیره نمی‌شد»: conn.commit() در مسیر ویرایش صدا زده نمی‌شد
-  [ATOMIC] بررسی موجودی و کسر موجودی حالا در یک اتصال/تراکنش واحد انجام می‌شود (رفع race condition)
-  [NUM] شماره‌گذاری EX- بر اساس مقدار عددی (رفع اشکال مرز ۱۰۰۰۰؛ EX-10000 دیگر از EX-9999 کوچک‌تر نیست)
-  [C1]  یکپارچه‌سازی صندوق/بانک: کار با treasury_accounts و treasury_transactions
-        (به جای cash_accounts و cash_transactions — هماهنگ با schema و FK موجود)
-  [FIX] تعمیر کامل تخریب‌های کپی-پیست (سینتکس): __init__، _build_ui، self.date_edit، < و ...
+️ نسخه اصلاح‌شده (بازبینی ۱۴۰۵/۵/۱۱):
+[C5]  رفع باگ بحرانی «ویرایش هزینه»:
+- تراکنش‌های نقدی قبلی این هزینه برگردانده می‌شوند (موجودی حساب قبلی بازگردانده می‌شود)
+- تراکنش جدید با مبلغ و حساب جدید ثبت می‌شود
+[C5b] رفع باگ «ویرایش ذخیره نمی‌شد»: conn.commit() در مسیر ویرایش صدا زده نمی‌شد
+[ATOMIC] بررسی موجودی و کسر موجودی حالا در یک اتصال/تراکنش واحد انجام می‌شود (رفع race condition)
+[NUM] شماره‌گذاری EX- بر اساس مقدار عددی (رفع اشکال مرز ۱۰۰۰؛ EX-10000 دیگر از EX-9999 کوچک‌تر نیست)
+[C1]  یکپارچه‌سازی صندوق/بانک: کار با treasury_accounts و treasury_transactions
+(به جای cash_accounts و cash_transactions — هماهنگ با schema و FK موجود)
+[FIX] تعمیر کامل تخریب‌های کپی-پیست (سینتکس): init، _build_ui، self.date_edit، < و ...
 """
-
 from datetime import datetime
 from typing import Optional
 
@@ -24,6 +22,9 @@ from PyQt5.QtWidgets import (
     QPushButton, QGroupBox, QMessageBox, QFrame, QDateEdit,
     QComboBox, QTextEdit, QFormLayout,
 )
+
+# ✅ اضافه کردن import تاریخ شمسی
+from app.core.jalali import jalali_date_display_from_iso
 
 
 class ExpenseWindow(QDialog):
@@ -37,14 +38,20 @@ class ExpenseWindow(QDialog):
         self.next_expense_no = None
         self.setWindowTitle('ویرایش هزینه' if expense_id else 'ثبت هزینه جدید')
         self.resize(700, 800)
+        
+        # ✅ باز شدن به صورت ماکزیمم
+        self.setWindowState(self.windowState() | Qt.WindowMaximized)
+        
         self.setLayoutDirection(Qt.RightToLeft)
         self._build_ui()
         self._load_categories()
         self._load_accounts()
+        
         if expense_id:
             self._load_expense(expense_id)
         else:
             self._generate_next_expense_no()
+            self._update_jalali_date_label()  # ✅ مقداردهی اولیه لیبل شمسی
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -81,7 +88,18 @@ class ExpenseWindow(QDialog):
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat('yyyy-MM-dd')
+        # ✅ اتصال سیگنال تغییر تاریخ به بروزرسانی لیبل شمسی
+        self.date_edit.dateChanged.connect(self._update_jalali_date_label)
         form_layout.addRow("تاریخ هزینه:", self.date_edit)
+
+        # ✅ لیبل تاریخ شمسی
+        self.jalali_date_lbl = QLabel()
+        self.jalali_date_lbl.setStyleSheet(
+            "color: #0284c7; font-weight: bold; font-size: 14px; "
+            "padding: 6px; background: #f0f9ff; border-radius: 5px; "
+            "border: 1px solid #bae6fd;"
+        )
+        form_layout.addRow(" تاریخ شمسی:", self.jalali_date_lbl)
 
         # دسته‌بندی
         self.category_combo = QComboBox()
@@ -132,7 +150,6 @@ class ExpenseWindow(QDialog):
         # دکمه‌های پایین
         bottom_row = QHBoxLayout()
         bottom_row.addStretch()
-
         save_btn = QPushButton("ذخیره هزینه")
         save_btn.setObjectName('PrimaryButton')
         save_btn.setMinimumHeight(50)
@@ -144,8 +161,18 @@ class ExpenseWindow(QDialog):
         cancel_btn.setMinimumHeight(50)
         cancel_btn.clicked.connect(self.reject)
         bottom_row.addWidget(cancel_btn)
-
         root.addLayout(bottom_row)
+
+    def _update_jalali_date_label(self):
+        """✅ بروزرسانی لیبل تاریخ شمسی هنگام تغییر تاریخ"""
+        if not hasattr(self, 'jalali_date_lbl'):
+            return
+        iso_date = self.date_edit.date().toString('yyyy-MM-dd')
+        try:
+            shamsi_str = jalali_date_display_from_iso(iso_date)
+            self.jalali_date_lbl.setText(f"  {shamsi_str}")
+        except Exception:
+            self.jalali_date_lbl.setText(f"  {iso_date}")
 
     def _load_accounts(self):
         """بارگذاری حساب‌های نقدی فعال (treasury_accounts)"""
@@ -157,7 +184,6 @@ class ExpenseWindow(QDialog):
                     WHERE is_active = 1
                     ORDER BY account_type, name
                 ''').fetchall()
-
                 self.account_combo.clear()
                 self.account_combo.addItem("-- انتخاب حساب --", None)
                 for r in rows:
@@ -173,7 +199,6 @@ class ExpenseWindow(QDialog):
         if not account_id:
             self.account_balance_lbl.setText("موجودی: 0 ریال")
             return
-
         try:
             with self.db.connect() as conn:
                 row = conn.execute(
@@ -195,7 +220,6 @@ class ExpenseWindow(QDialog):
                 ORDER BY CAST(SUBSTR(expense_no, 4) AS INTEGER) DESC
                 LIMIT 1
             ''').fetchone()
-
             if row and row['expense_no']:
                 try:
                     last_no = int(row['expense_no'].replace('EX-', ''))
@@ -204,7 +228,6 @@ class ExpenseWindow(QDialog):
                     next_no = 1
             else:
                 next_no = 1
-
             self.next_expense_no = f"EX-{next_no:04d}"
             self.expense_no_lbl.setText(self.next_expense_no)
             self.ref_input.setText(self.next_expense_no)
@@ -218,7 +241,6 @@ class ExpenseWindow(QDialog):
                 WHERE is_active = 1
                 ORDER BY name
             ''').fetchall()
-
             self.category_combo.clear()
             self.category_combo.addItem("-- انتخاب دسته‌بندی --", None)
             for r in rows:
@@ -232,38 +254,34 @@ class ExpenseWindow(QDialog):
                        paid_amount, reference_doc_id, paid_from_account_id
                 FROM expenses WHERE id = ?
             ''', (expense_id,)).fetchone()
-
             if not row:
                 QMessageBox.warning(self, "خطا", "هزینه مورد نظر یافت نشد.")
                 self.reject()
                 return
-
             self.expense_no_lbl.setText(row['expense_no'] or f"ID-{expense_id}")
             self.expense_no_lbl.setStyleSheet(
                 "font-weight: bold; color: #6b7280; font-size: 16px; padding: 8px; "
                 "background: #f3f4f6; border-radius: 5px; border: 1px solid #d1d5db;"
             )
-
             try:
                 date = QDate.fromString(row['expense_date'], 'yyyy-MM-dd')
                 self.date_edit.setDate(date)
             except Exception:
                 pass
-
+            
+            # ✅ بروزرسانی لیبل تاریخ شمسی پس از تنظیم تاریخ
+            self._update_jalali_date_label()
+            
             for i in range(self.category_combo.count()):
                 if self.category_combo.itemData(i) == row['category_id']:
                     self.category_combo.setCurrentIndex(i)
                     break
-
             self.amount_input.setText(str(row['amount']))
             self.paid_input.setText(str(row['paid_amount'] or 0))
-
             if row['reference_doc_id']:
                 self.ref_input.setText(str(row['reference_doc_id']))
-
             if row['description']:
                 self.desc_input.setPlainText(row['description'])
-
             # بارگذاری حساب پرداخت
             if row['paid_from_account_id']:
                 for i in range(self.account_combo.count()):
@@ -277,15 +295,12 @@ class ExpenseWindow(QDialog):
             amount = int(self.amount_input.text().replace(',', ''))
         except ValueError:
             amount = 0
-
         try:
             paid = int(self.paid_input.text().replace(',', '') or '0')
         except ValueError:
             paid = 0
-
         balance = amount - paid
         self.balance_lbl.setText(f"{balance:,} ریال")
-
         if balance > 0:
             self.balance_lbl.setStyleSheet("font-weight: bold; color: #dc2626; font-size: 14px;")
         elif balance == 0:
@@ -298,7 +313,6 @@ class ExpenseWindow(QDialog):
     # ------------------------------------------------------------------
     def _revert_expense_cash_transactions(self, conn, expense_id: int) -> int:
         """تراکنش‌های نقدی ثبت‌شده برای این هزینه را برمی‌گرداند (موجودی حساب‌ها بازگردانده می‌شود).
-
         تعداد تراکنش‌های برگردانده‌شده را برمی‌گرداند.
         """
         old_txs = conn.execute(
@@ -321,12 +335,10 @@ class ExpenseWindow(QDialog):
         if not category_id:
             QMessageBox.warning(self, "خطا", "لطفاً یک دسته‌بندی انتخاب کنید.")
             return
-
         account_id = self.account_combo.currentData()
         if not account_id:
             QMessageBox.warning(self, "خطا", "لطفاً حساب پرداخت را انتخاب کنید.")
             return
-
         try:
             amount = int(self.amount_input.text().replace(',', ''))
             if amount <= 0:
@@ -334,7 +346,6 @@ class ExpenseWindow(QDialog):
         except ValueError:
             QMessageBox.warning(self, "خطا", "مبلغ کل باید یک عدد مثبت باشد.")
             return
-
         try:
             paid = int(self.paid_input.text().replace(',', '') or '0')
             if paid < 0:
@@ -342,11 +353,9 @@ class ExpenseWindow(QDialog):
         except ValueError:
             QMessageBox.warning(self, "خطا", "مبلغ پرداخت‌شده باید یک عدد غیرمنفی باشد.")
             return
-
         if paid > amount:
             QMessageBox.warning(self, "خطا", "مبلغ پرداخت‌شده نمی‌تواند بیشتر از مبلغ کل باشد.")
             return
-
         expense_date = self.date_edit.date().toString('yyyy-MM-dd')
         description = self.desc_input.toPlainText().strip()
         ref_doc_id = self.ref_input.text().strip()
@@ -355,14 +364,12 @@ class ExpenseWindow(QDialog):
                 ref_doc_id = int(ref_doc_id)
             except ValueError:
                 ref_doc_id = None
-
         if paid == 0:
             status = 'OPEN'
         elif paid >= amount:
             status = 'SETTLED'
         else:
             status = 'PARTIAL'
-
         # [ATOMIC] بررسی موجودی و همهٔ تغییرات در یک تراکنش واحد
         with self.db.connect() as conn:
             # بررسی موجودی حساب (در همان اتصالِ کسر)
@@ -372,7 +379,6 @@ class ExpenseWindow(QDialog):
             if not account_row:
                 QMessageBox.critical(self, "خطا", "حساب انتخاب‌شده یافت نشد.")
                 return
-
             balance_before = int(account_row['current_balance'] or 0)
             if balance_before < paid:
                 QMessageBox.critical(
@@ -383,18 +389,15 @@ class ExpenseWindow(QDialog):
                     f"کسری: {paid - balance_before:,.0f} ریال"
                 )
                 return
-
             if self.expense_id:
                 # ================== ویرایش ==================
                 # ۱) [C5] برگردانی تراکنش‌های نقدی قبلی این هزینه
                 self._revert_expense_cash_transactions(conn, self.expense_id)
-
                 # [FIX] پس از برگرداندن تراکنش‌های قبلی، موجودی حساب دوباره خوانده شود
                 account_row = conn.execute(
                     "SELECT current_balance, name FROM treasury_accounts WHERE id = ?", (account_id,)
                 ).fetchone()
                 balance_before = int(account_row['current_balance'] or 0)
-
                 # ۲) به‌روزرسانی سند هزینه
                 conn.execute('''
                     UPDATE expenses
@@ -404,7 +407,6 @@ class ExpenseWindow(QDialog):
                     WHERE id = ?
                 ''', (expense_date, category_id, description, amount, paid,
                       status, ref_doc_id, account_id, self.expense_id))
-
                 # ۳) ثبت تراکنش نقدی جدید (اگر پرداختی وجود دارد)
                 if paid > 0:
                     new_balance = balance_before - paid
@@ -420,17 +422,14 @@ class ExpenseWindow(QDialog):
                         ) VALUES (?, ?, 'OUT', 'EXPENSE', ?, ?, ?, ?, ?)
                     ''', (account_id, expense_date, self.expense_id, paid, new_balance,
                           f"هزینه ویرایش‌شده - {description or ''}", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-
                 conn.commit()  # [C5b] ویرایش قبلاً commit نمی‌شد!
                 QMessageBox.information(self, "موفقیت", "هزینه با موفقیت ویرایش شد.")
             else:
                 # ================== ثبت جدید ==================
                 expense_no = self.next_expense_no
-
                 existing = conn.execute(
                     "SELECT id FROM expenses WHERE expense_no = ?", (expense_no,)
                 ).fetchone()
-
                 if existing:
                     # [NUM] مرتب‌سازی عددی (مثل _generate_next_expense_no)
                     row = conn.execute('''
@@ -441,7 +440,6 @@ class ExpenseWindow(QDialog):
                     ''').fetchone()
                     last_no = int(str(row['expense_no']).replace('EX-', ''))
                     expense_no = f"EX-{last_no + 1:04d}"
-
                 # ثبت هزینه
                 conn.execute('''
                     INSERT INTO expenses (
@@ -450,9 +448,7 @@ class ExpenseWindow(QDialog):
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (expense_no, expense_date, category_id, description, amount,
                       paid, status, ref_doc_id, self.user_data['id'], account_id))
-
                 expense_id_new = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-
                 # ثبت تراکنش نقدی (اگر مبلغ پرداخت > 0)
                 if paid > 0:
                     new_balance = balance_before - paid
@@ -468,9 +464,7 @@ class ExpenseWindow(QDialog):
                         ) VALUES (?, ?, 'OUT', 'EXPENSE', ?, ?, ?, ?, ?)
                     ''', (account_id, expense_date, expense_id_new, paid, new_balance,
                           f"هزینه {expense_no} - {description or ''}", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-
                 conn.commit()
-
                 QMessageBox.information(
                     self, "موفقیت",
                     f"هزینه با شماره {expense_no} با موفقیت ثبت شد.\n\n"
@@ -478,5 +472,4 @@ class ExpenseWindow(QDialog):
                     f"از حساب: {account_row['name']}\n"
                     f"موجودی باقی‌مانده: {balance_before - paid:,.0f} ریال"
                 )
-
         self.accept()
