@@ -2,7 +2,7 @@
 """نقطه ورود اصلی برنامه - نسخه بازنویسی‌شده تمیز (تک‌نسخه‌ای از پچ‌های امن)"""
 # WEBENGINE-INIT-FIX: وب‌انجین باید قبل از QApplication مقداردهی شود
 try:  # WEBENGINE-INIT-FIX
-    from PyQt5.QtCore import Qt as _Qt_AA  # WEBENGINE-INIT-FIX
+    from PyQt5.QtCore import Qt, QObject, QEvent, QObject, QEvent as _Qt_AA  # WEBENGINE-INIT-FIX
     from PyQt5.QtWidgets import QApplication as _QApp_AA  # WEBENGINE-INIT-FIX
     _QApp_AA.setAttribute(_Qt_AA.AA_ShareOpenGLContexts, True)  # WEBENGINE-INIT-FIX
     import PyQt5.QtWebEngineWidgets  # noqa  # WEBENGINE-INIT-FIX
@@ -35,7 +35,7 @@ from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (QApplication, QDialog, QMessageBox, QMainWindow,
                              QScrollArea, QVBoxLayout, QWidget, QTabWidget,
                              QTableWidget, QHeaderView, QComboBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QObject, QEvent
 
 os.environ.setdefault('QTWEBENGINE_DISABLE_SANDBOX', '1')  # PREV-FIX
 
@@ -88,12 +88,11 @@ def _compact_window(w):
 def _safe_flags(w):
     try:
         f = w.windowFlags()
-        f |= Qt.Window | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint
+        f |= Qt.Window | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint
         f &= ~Qt.WindowContextHelpButtonHint
-        if f != w.windowFlags():
-            w.setWindowFlags(f)
-        if w.minimumSize() == w.maximumSize():
-            w.setMaximumSize(16777215, 16777215)
+        w.setWindowFlags(f)
+        # آزاد کردن قفل ماکسیمم‌سازی
+        w.setMaximumSize(16777215, 16777215)
     except Exception:
         pass
 
@@ -180,7 +179,107 @@ def _mk_sa(wgt):
     return sa
 
 
+
+class _WheelForward(QObject):
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() != QEvent.Wheel:
+                return False
+            w = obj
+            if not isinstance(w, QWidget) or isinstance(w, QScrollArea):
+                return False
+            # اگر خود کنترل اسکرول داخلی دارد (مثل جداول پرینت یا ادیتور بزرگ)، مداخله نکن
+            try:
+                v = w.verticalScrollBar() if hasattr(w, 'verticalScrollBar') else None
+                if v is not None and v.minimum() != v.maximum():
+                    return False
+            except Exception:
+                pass
+
+            p = w.parentWidget()
+            while p is not None and not isinstance(p, QScrollArea):
+                p = p.parentWidget()
+            if p is None:
+                return False
+            
+            sb = p.verticalScrollBar()
+            if sb and sb.isVisible():
+                delta = ev.angleDelta().y()
+                step = sb.singleStep() or 30
+                if delta < 0:
+                    sb.setValue(sb.value() + step)
+                elif delta > 0:
+                    sb.setValue(sb.value() - step)
+                return True
+        except Exception:
+            pass
+        return False
+
+_wheel_forwarder = _WheelForward()
+
+
+# --- LAPTOP & COMBOBOX SCROLL FIX ---
+class _SmartGlobalFilter(QObject):
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.Wheel:
+                # الف) بی‌حس کردن چرخ موس روی کمبوباکس در حالت بسته
+                if isinstance(obj, QComboBox):
+                    v = obj.view()
+                    if v is None or not v.isVisible():
+                        ev.ignore()
+                        return True
+        except Exception:
+            pass
+        return False
+
+_smart_global_filter = _SmartGlobalFilter()
+
+def _auto_fit_tab_scroll(tab_widget):
+    """تجهیز خودکار تب‌های بلند به اسکرول‌بار نرم"""
+    try:
+        scr = QApplication.desktop().availableGeometry()
+        for idx in range(tab_widget.count()):
+            w = tab_widget.widget(idx)
+            if w is not None and not isinstance(w, QScrollArea) and not getattr(w, '_wrapped_sa', False):
+                if w.sizeHint().height() > (scr.height() - 120):
+                    sa = _mk_sa(w)
+                    sa._wrapped_sa = True
+                    tab_widget.removeTab(idx)
+                    tab_widget.insertTab(idx, sa, tab_widget.tabText(idx))
+    except Exception:
+        pass
+# ------------------------------------
+
+
+# --- COMBOBOX WHEEL GUARD ---
+class _ComboWheelGuard(QObject):
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.Wheel and isinstance(obj, QComboBox):
+                v = obj.view()
+                # اگر لیست بازشو بسته است، رویداد چرخ را خنثی کن
+                if v is None or not v.isVisible():
+                    ev.ignore()
+                    return True
+        except Exception:
+            pass
+        return False
+
+_combo_wheel_guard = _ComboWheelGuard()
+
+def _protect_combos(parent_widget):
+    try:
+        for cb in parent_widget.findChildren(QComboBox):
+            if not getattr(cb, '_wheel_guarded', False):
+                cb._wheel_guarded = True
+                cb.installEventFilter(_combo_wheel_guard)
+    except Exception:
+        pass
+# ----------------------------
+
 def _safe_fit(w):
+    _protect_combos(w)
     # گارد امن برای جلوگیری از تغییر سایز پنجره‌های حساس
     cls_name = w.__class__.__name__
     if 'Login' in cls_name or 'Preview' in cls_name or getattr(w, '_no_compact', False):
@@ -310,6 +409,14 @@ def main():
     from app.ui.login_window import LoginWindow
     from app.ui.main_window import MainWindow
     app = QApplication(sys.argv)
+    try:
+        app.installEventFilter(_smart_global_filter)
+    except Exception:
+        pass
+    try:
+        app.installEventFilter(_wheel_forwarder)
+    except Exception:
+        pass
     _ico = ''
     try:
         import glob as _gb
